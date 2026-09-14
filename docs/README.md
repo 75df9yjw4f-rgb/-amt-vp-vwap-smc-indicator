@@ -19,11 +19,20 @@ Volume Profile, VWAP и базовый Market Structure / SMC в **единый 
 | `07-performance-and-roadmap.md` | Этапы 8, 10, 11: производительность, названия, план разработки |
 | `08-footprint.md` | **Проверка `request.footprint()`** по актуальной документации — отменяет часть 🔴-вердиктов |
 | `P0-acceptance.md` | Отчёт и критерии приёмки фазы P0 |
+| `P1-acceptance.md` | Отчёт и критерии приёмки фазы P1 + протокол сравнения с нативным VP |
 
 ## Статус
 
-✅ **P0 завершён** — каркас `src/ACE.pine` (v0.1.0-P0).
-⏳ Ожидается подтверждение перед стартом **P1 (Profile Engine)**.
+✅ **P0** — каркас · ✅ **P1** — Profile Engine (v0.2.0-P1).
+⏳ Ожидается подтверждение перед стартом **P3 (VWAP Engine)**.
+
+### Сборка (вариант B)
+```bash
+python3 tools/build.py          # -> build/ACE.pine (STD), build/ACE-Pro.pine (PRO)
+python3 tools/build.py --check  # проверить синхронность с src/
+```
+`build/ACE.pine` не содержит `request.footprint()` и работает на любом тарифе.
+`build/ACE-Pro.pine` требует Premium/Ultimate.
 
 > ⚠️ Критерий «компилируется без ошибок» проверяется только в Pine Editor —
 > офлайн-компилятора Pine Script не существует. См. `P0-acceptance.md`.

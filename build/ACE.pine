@@ -64,7 +64,7 @@ const string ACE_NAME    = "Auction Context Engine"
 const string ACE_SHORT   = "ACE"
 const string ACE_VERSION = "0.2.0-P1"
 const string ACE_PHASE   = "P1 - profile engine"
-const string ACE_BUILD   = "PRO"   // rewritten to "STD" by tools/build.py
+const string ACE_BUILD   = "STD"   // rewritten to "STD" by tools/build.py
 
 // ============================================================================
 //  1. ENUMS
@@ -550,50 +550,21 @@ if volumeValid
 // ============================================================================
 //  8. L3 FOOTPRINT ADAPTER                                    [P7 - not active]
 // ----------------------------------------------------------------------------
-//  #region L3 FOOTPRINT ADAPTER
+//  L3 FOOTPRINT ADAPTER - REMOVED IN THE STANDARD BUILD
 //
-//  This region is the ONLY place in the script that may touch `request.footprint()`
-//  or the `footprint` / `volume_row` types. Everything else consumes it through
-//  the single entry point `fpBarContribution()`.
-//
-//  WHY IT IS ISOLATED (docs/08-footprint.md section 5):
-//    Merely CONTAINING a request.footprint() call makes the whole script unusable
-//    for Basic / Essential / Plus accounts - TradingView blocks it at the plan
-//    level, it does not simply return na. Deleting this one region therefore
-//    yields a valid all-plans build with zero changes anywhere else.
-//
-//  HARD CONSTRAINTS confirmed against the official v6 documentation:
-//    - exactly ONE request.footprint() call per script (a second raises a
-//      runtime error), and any request.security() whose expression depends on
-//      footprint data counts as that one call;
-//    - `ticks_per_row` is therefore a single global parameter;
-//    - the request always targets the CHART timeframe - session aggregation is
-//      done by our own Profile Engine, not by the footprint;
-//    - buy/sell volume is classified by INTRABAR PRICE DIRECTION, not by
-//      bid/ask aggressor. It is a high-quality proxy, not true order flow;
-//    - footprint data is "repainting by design": granularity degrades with bar
-//      age (1 tick -> 1s -> 1m -> 60m), so closed-bar values can differ after a
-//      chart reload. We call this SOURCE DRIFT and always surface it;
-//    - on timeframes >= 1D, footprint total volume can differ materially from
-//      the `volume` variable (EOD feeds include block/OTC trades).
-//
-//  P0 STATUS: interface only. No request.footprint() call exists yet, so this
-//  build runs on every TradingView plan.
-// ----------------------------------------------------------------------------
+//  This build contains no request.footprint() call and therefore runs on every
+//  TradingView plan. The Pro build (build/ACE-Pro.pine) keeps the adapter and
+//  requires a Premium or Ultimate plan. Both are generated from src/ACE.pine.
 
-//@variable Reports whether L3 data was actually obtained for this bar.
-//          P0 always returns false; P7 replaces the body only.
+//@function Always false in the Standard build: no footprint data is requested.
 fpAvailable() =>
     false
 
-//@function Single entry point for L3. In P7 this fills the profile bins from
-//          footprint rows; until then it reports "no contribution made".
-//@returns  true when the profile bins were filled from footprint data.
+//@function Inert in the Standard build.
 fpBarContribution(Profile p) =>
     bool _unused = na(p)
     false
 
-//  #endregion L3 FOOTPRINT ADAPTER
 // ============================================================================
 
 // ============================================================================
