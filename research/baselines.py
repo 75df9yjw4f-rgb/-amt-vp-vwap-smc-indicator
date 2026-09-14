@@ -127,3 +127,83 @@ def ace_context(bias):
     if b < 0.60:
         return 'moderate'
     return 'strong'
+
+
+# ---------------------------------------------------------------------------
+#  SCALP VARIANTS - symmetric 1:1 bracket
+# ---------------------------------------------------------------------------
+#  Same ACE entry logic as B1/B2/B3; only the exit changes. The target mirrors
+#  the stop instead of coming from an ACE level, which has three consequences
+#  worth stating rather than discovering later:
+#
+#   1. The "target already behind the entry" rejection in B2/B3 disappears,
+#      because a mirrored target can never sit behind the entry. On the held-out
+#      set that admits 42 more B2 and 14 more B3 signals, so the signal
+#      population is NOT the same one B1/B2/B3 produce.
+#   2. Outcomes become near-binary, +1R or -1R, which makes the permutation test
+#      and the veto matrix read more cleanly than a spread of R multiples.
+#   3. The pessimistic same-bar convention bites harder here. With stop and
+#      target equidistant, a bar containing both is more likely than at 2:1, and
+#      every such bar is scored as a loss. This is kept, not softened: intrabar
+#      order is unknowable from OHLC and the alternative flatters the result.
+#
+#  The bias-neutral exit of B1 is dropped in the scalp variant so the bracket is
+#  pure: stop, target, or the time stop. The originals are left untouched.
+
+SCALP_STOP_ATR = 1.5      # unchanged from the frozen baselines
+SCALP_RR       = 1.0      # target mirrors the stop
+
+
+def _scalp(sig):
+    if sig is None:
+        return None
+    e, sgn = sig['entry'], (1 if sig['side'] == 'LONG' else -1)
+    risk = abs(e - sig['stop'])
+    return {'baseline': sig['baseline'] + 's', 'side': sig['side'], 'entry': e,
+            'stop': sig['stop'], 'target': e + sgn * SCALP_RR * risk,
+            'exit_on_bias_neutral': False}
+
+
+def b1s(h):
+    return _scalp(b1_bias_flip(h))
+
+
+def b2s(h):
+    """B2 entry without the target-validity gate, which a 1:1 target makes moot."""
+    if len(h) < 2:
+        return None
+    c, p = h[-1], h[-2]
+    if not _ok(c.get('dev_vah'), c.get('dev_val'), p.get('dev_vah'),
+               p.get('dev_val'), c.get('atr')) or c['atr'] <= 0:
+        return None
+    if p['close'] < p['dev_val'] and c['close'] > c['dev_val']:
+        side, sgn = 'LONG', 1
+    elif p['close'] > p['dev_vah'] and c['close'] < c['dev_vah']:
+        side, sgn = 'SHORT', -1
+    else:
+        return None
+    e, a = c['close'], c['atr']
+    return _scalp({'baseline': 'B2', 'side': side, 'entry': e,
+                   'stop': e - sgn * STOP_ATR * a, 'target': e + sgn * a})
+
+
+def b3s(h):
+    """B3 entry without the band-target gate, for the same reason."""
+    if len(h) < 2:
+        return None
+    c, p = h[-1], h[-2]
+    if not _ok(c.get('vwap_sess'), p.get('vwap_sess'), c.get('bias'), c.get('atr')) \
+       or c['atr'] <= 0:
+        return None
+    if p['close'] <= p['vwap_sess'] and c['close'] > c['vwap_sess'] and c['bias'] > 0:
+        side, sgn = 'LONG', 1
+    elif p['close'] >= p['vwap_sess'] and c['close'] < c['vwap_sess'] and c['bias'] < 0:
+        side, sgn = 'SHORT', -1
+    else:
+        return None
+    e, a = c['close'], c['atr']
+    return _scalp({'baseline': 'B3', 'side': side, 'entry': e,
+                   'stop': e - sgn * STOP_ATR * a, 'target': e + sgn * a})
+
+
+SCALP = {'B1s': b1s, 'B2s': b2s, 'B3s': b3s}

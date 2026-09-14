@@ -10,13 +10,14 @@ import argparse, json, os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from ace_data import load_csv
-from baselines import BASELINES, regime, ace_context
+from baselines import BASELINES, SCALP, regime, ace_context
 from snapshot import build as build_snapshot
 from outcomes import simulate
 import deciders
 
 
-def run(rows, decider, symbol="ANON-1", timeframe="TF-A", which=("B1", "B2", "B3")):
+def run(rows, decider, symbol="ANON-1", timeframe="TF-A", which=("B1", "B2", "B3"),
+        book=None):
     log, open_until = [], {}
     for i in range(len(rows)):
         history = rows[:i + 1]          # the ONLY thing a decision may see
@@ -25,7 +26,7 @@ def run(rows, decider, symbol="ANON-1", timeframe="TF-A", which=("B1", "B2", "B3
                 continue                # one position per baseline at a time
             if not rows[i].get('gap_ok', True):
                 continue        # hole in the series; see mark_gaps()
-            sig = BASELINES[name](history)
+            sig = (book or BASELINES)[name](history)
             if not sig:
                 continue
 
@@ -86,6 +87,8 @@ def main():
                     choices=["accept_all", "random", "claude"])
     ap.add_argument("--veto-rate", type=float, default=0.3)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--scalp", action="store_true",
+                    help="use the symmetric 1:1 variants B1s/B2s/B3s")
     ap.add_argument("--out", default="research/out/decisions.jsonl")
     args = ap.parse_args()
 
@@ -103,7 +106,9 @@ def main():
               f"| absent from export: {len(missing)}")
         if missing:
             print("  absent:", ", ".join(missing))
-        all_log += run(rows, dec, symbol=f"ANON-{n}")
+        book = SCALP if args.scalp else None
+        names = tuple(SCALP) if args.scalp else ("B1", "B2", "B3")
+        all_log += run(rows, dec, symbol=f"ANON-{n}", which=names, book=book)
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as fh:
