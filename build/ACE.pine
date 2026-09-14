@@ -62,8 +62,8 @@ indicator(
 // ============================================================================
 const string ACE_NAME    = "Auction Context Engine"
 const string ACE_SHORT   = "ACE"
-const string ACE_VERSION = "0.6.0-P7"
-const string ACE_PHASE   = "P7 - volume / order flow"
+const string ACE_VERSION = "0.7.0-P4"
+const string ACE_PHASE   = "P4 - AMT engine"
 const string ACE_BUILD   = "STD"   // rewritten to "STD" by tools/build.py
 
 // ============================================================================
@@ -109,6 +109,13 @@ enum BalanceMode
     vaOverlap  = "Value Area overlap"
     efficiency = "Efficiency ratio"
     combined   = "Combined (2 of 3)"
+
+//@enum Reference level that acceptance and rejection are measured against.
+enum AcceptRef
+    prevValue      = "Previous value area"
+    curValue       = "Current value area"
+    initialBalance = "Initial Balance"
+    openingRange   = "Opening Range"
 
 //@enum Break confirmation style for market structure.
 enum BreakMode
@@ -311,13 +318,37 @@ VaAlgo vaAlgo = input.enum(VaAlgo.classic, "Value Area algorithm", group = G_AMT
 int ibMinutes = input.int(60, "Initial Balance (minutes)", minval = 1, group = G_AMT)
 bool showIbExt = input.bool(true, "Show IB extensions (1x / 2x)", group = G_AMT)
 int orMinutes = input.int(15, "Opening Range (minutes)", minval = 1, group = G_AMT)
+float openDriveFrac = input.float(0.50, "Open type: drive threshold (x OR range)", minval = 0.1, maxval = 2.0, step = 0.05, group = G_AMT,
+     tooltip = "Open type classification is INTERPRETATION and schools differ. " +
+               "These two thresholds define the formalisation this script uses.")
+float openTolFrac = input.float(0.25, "Open type: opposite excursion tolerance", minval = 0.0, maxval = 1.0, step = 0.05, group = G_AMT)
+bool showIb = input.bool(true, "Draw IB / OR levels", group = G_AMT, inline = "amtdraw")
+bool showBalanceBox = input.bool(true, "Draw balance range", group = G_AMT, inline = "amtdraw")
 BalanceMode balMode = input.enum(BalanceMode.combined, "Balance detection", group = G_AMT,
      tooltip = "There is no canonical definition of balance. Combined requires " +
                "2 of 3 methods to agree. See docs/04-algorithms.md section 3.3.")
-int balLookback = input.int(20, "Balance lookback (bars)", minval = 5, group = G_AMT)
+int balLookback = input.int(20, "Balance lookback (bars)", minval = 5, maxval = 500, group = G_AMT)
+float balVaOverlap = input.float(0.60, "Balance: min value-area overlap", minval = 0.0, maxval = 1.0, step = 0.05, group = G_AMT,
+     tooltip = "Method B2. Balance means value is being re-accepted where it " +
+               "already was, so the current value area must still overlap the " +
+               "previous one by at least this fraction.")
+float erLow = input.float(0.30, "Balance: efficiency ratio below", minval = 0.0, maxval = 1.0, step = 0.05, group = G_AMT, inline = "er")
+float erHigh = input.float(0.60, "trend above", minval = 0.0, maxval = 1.0, step = 0.05, group = G_AMT, inline = "er",
+     tooltip = "Method B3 (Kaufman). Low efficiency means the market covers " +
+               "little net distance for the movement it makes.")
+int minBalanceBars = input.int(10, "Balance: bars before a breakout counts", minval = 2, group = G_AMT)
+float dBreakAtr = input.float(0.25, "Balance: breakout margin (x ATR)", minval = 0.0, step = 0.05, group = G_AMT)
+bool balNeedsVolume = input.bool(true, "Balance: breakout needs relative volume", group = G_AMT)
 float balAtrMult = input.float(1.5, "Balance range (x ATR)", minval = 0.1, step = 0.1, group = G_AMT)
+AcceptRef accRef = input.enum(AcceptRef.prevValue, "Acceptance / rejection reference", group = G_AMT,
+     tooltip = "Previous value area is the most AMT-authentic choice: acceptance " +
+               "means price is being accepted OUTSIDE where value was built.")
 int accCloses = input.int(2, "Acceptance: closes required", minval = 1, group = G_AMT,
      tooltip = "Acceptance thresholds are conventional, not canonical.")
+int accWindow = input.int(10, "Acceptance: time window (bars)", minval = 2, maxval = 200, group = G_AMT)
+bool accNeedsMigration = input.bool(false, "Acceptance: require developing POC to migrate", group = G_AMT,
+     tooltip = "The strictest reading: price is only accepted once value itself " +
+               "has moved beyond the level, not merely price.")
 float accTimePct = input.float(50.0, "Acceptance: time beyond level %", minval = 1.0, maxval = 100.0, group = G_AMT)
 float rejWick = input.float(0.6, "Rejection: wick ratio", minval = 0.1, maxval = 1.0, step = 0.05, group = G_AMT)
 
@@ -2111,6 +2142,362 @@ else
     engVol.summary := volumeValid ? "warming up" : "no volume data"
 
 // ============================================================================
+//  10g. AMT ENGINE                                                        [P4]
+// ----------------------------------------------------------------------------
+//  Auction Market Theory is an INTERPRETIVE FRAMEWORK, not a set of formulas.
+//  What is algorithmised here are its measurable proxies, and every threshold
+//  that a school of thought could argue about is an input, not a constant.
+//
+//  FACT ONLY. This engine emits:
+//    - levels      IB high/low and extensions, OR high/low, balance boundaries
+//    - states      in balance or not, how many methods agree, which level was
+//                  accepted or rejected, and in which direction
+//    - magnitudes  acceptance strength, initiative and responsive volume shares
+//
+//  It emits no sign for the score and no BUY/SELL of any kind. The Context
+//  Engine turns "accepted above the prior value area" into a contribution; this
+//  engine only establishes that it happened and how strongly.
+//
+//  Placed last among the engines because it consumes the profile (value areas),
+//  the order flow tier (directional volume) and ATR.
+// ============================================================================
+
+// ---- session clock ---------------------------------------------------------
+
+var int sessStartTime = na
+if isNewDay
+    sessStartTime := time
+
+//@variable Minutes elapsed since the session opened.
+int minsIntoSession = na(sessStartTime) ? na : int((time - sessStartTime) / 60000)
+
+//@variable IB and OR are intraday constructs. On a chart whose bars are longer
+//          than the window itself they would collapse to a single bar, which
+//          would be a meaningless number dressed up as a level - so they are
+//          reported as unavailable instead.
+bool ibApplicable = timeframe.in_seconds() <= ibMinutes * 60 and timeframe.in_seconds() < 86400
+bool orApplicable = timeframe.in_seconds() <= orMinutes * 60 and timeframe.in_seconds() < 86400
+
+// ---- Initial Balance -------------------------------------------------------
+
+var float ibH = na
+var float ibL = na
+var bool  ibDone = false
+var float sessOpen = na
+
+if isNewDay
+    ibH      := high
+    ibL      := low
+    ibDone   := false
+    sessOpen := open
+else if not ibDone and not na(minsIntoSession)
+    if minsIntoSession < ibMinutes
+        ibH := math.max(nz(ibH, high), high)
+        ibL := math.min(nz(ibL, low), low)
+    else
+        ibDone := true
+
+float ibRange = not na(ibH) and not na(ibL) ? ibH - ibL : na
+float ibExt1U = not na(ibRange) ? ibH + ibRange : na
+float ibExt1D = not na(ibRange) ? ibL - ibRange : na
+float ibExt2U = not na(ibRange) ? ibH + 2 * ibRange : na
+float ibExt2D = not na(ibRange) ? ibL - 2 * ibRange : na
+
+// ---- Opening Range ---------------------------------------------------------
+
+var float orH = na
+var float orL = na
+var bool  orDone = false
+var bool  orTouchedAbove = false
+var bool  orTouchedBelow = false
+var float orMaxUp = 0.0
+var float orMaxDn = 0.0
+
+if isNewDay
+    orH            := high
+    orL            := low
+    orDone         := false
+    orTouchedAbove := false
+    orTouchedBelow := false
+    orMaxUp        := 0.0
+    orMaxDn        := 0.0
+else if not orDone and not na(minsIntoSession)
+    if minsIntoSession < orMinutes
+        orH := math.max(nz(orH, high), high)
+        orL := math.min(nz(orL, low), low)
+        if not na(sessOpen)
+            if high > sessOpen
+                orTouchedAbove := true
+                orMaxUp := math.max(orMaxUp, high - sessOpen)
+            if low < sessOpen
+                orTouchedBelow := true
+                orMaxDn := math.max(orMaxDn, sessOpen - low)
+    else
+        orDone := true
+
+// ---- Open type (INTERPRETATION, convention-dependent) ----------------------
+// Classified once, on the bar the opening range completes. The rules below are
+// ONE formalisation; schools differ, and the thresholds are inputs.
+
+var string openType = "-"
+if isNewDay
+    openType := "-"
+if orApplicable and orDone and openType == "-" and not na(sessOpen)
+    float orRange = nz(orH, high) - nz(orL, low)
+    float netMove = close - sessOpen
+    float driveNeed = openDriveFrac * math.max(orRange, syminfo.mintick)
+    bool bothSides = orTouchedAbove and orTouchedBelow
+    float opposite = netMove > 0 ? orMaxDn : orMaxUp
+    if math.abs(netMove) >= driveNeed and (not bothSides or opposite <= openTolFrac * orRange)
+        // Directional from the open, with little or no opposite excursion.
+        openType := "Open-Drive"
+    else if math.abs(netMove) >= driveNeed and bothSides
+        // Tested the other side first, then drove.
+        openType := "Open-Test-Drive"
+    else if bothSides and math.abs(netMove) < driveNeed and opposite > openTolFrac * orRange
+        openType := "Open-Rejection-Reverse"
+    else
+        openType := "Open-Auction"
+
+// ---- Balance detection -----------------------------------------------------
+// No canonical definition exists, so three independent methods are offered and
+// the default requires two of the three to agree.
+
+float balHH = ta.highest(high, balLookback)
+float balLL = ta.lowest(low, balLookback)
+
+//@variable B1 - range compression against ATR.
+bool balM1 = not na(atr) and atr > 0 and (balHH - balLL) <= balAtrMult * atr
+
+//@variable B2 - the current value area still overlaps the previous one.
+//          Closest to the actual AMT idea: balance means value is being
+//          re-accepted where it already was.
+float vaOverlap = na
+if curProf.ready and prvProf.ready and not na(curProf.vah) and not na(prvProf.vah)
+    float interLo = math.max(curProf.val, prvProf.val)
+    float interHi = math.min(curProf.vah, prvProf.vah)
+    float unionLo = math.min(curProf.val, prvProf.val)
+    float unionHi = math.max(curProf.vah, prvProf.vah)
+    float inter = math.max(0.0, interHi - interLo)
+    float uni = unionHi - unionLo
+    vaOverlap := uni > 0 ? inter / uni : na
+bool balM2 = not na(vaOverlap) and vaOverlap >= balVaOverlap
+
+//@variable B3 - Kaufman efficiency ratio. Low means the market is covering
+//          little net distance for the movement it makes.
+float erDirection = math.abs(close - close[balLookback])
+float erVolatility = math.sum(math.abs(close - close[1]), balLookback)
+float efficiency = erVolatility > 0 ? erDirection / erVolatility : na
+bool balM3 = not na(efficiency) and efficiency < erLow
+bool trendM3 = not na(efficiency) and efficiency > erHigh
+
+//@variable How many of the three methods currently call it balance, 0..3.
+//          A magnitude, not a verdict.
+int balAgree = (balM1 ? 1 : 0) + (balM2 ? 1 : 0) + (balM3 ? 1 : 0)
+
+bool balanceNow = switch balMode
+    BalanceMode.atrRange   => balM1
+    BalanceMode.vaOverlap  => balM2
+    BalanceMode.efficiency => balM3
+    BalanceMode.combined   => balAgree >= 2
+    => balAgree >= 2
+
+var bool  inBalance  = false
+var float balHi      = na
+var float balLo      = na
+var int   balBars    = 0
+var int   balStart   = na
+
+if balanceNow
+    if not inBalance
+        inBalance := true
+        balStart  := bar_index
+        balBars   := 1
+        balHi     := balHH
+        balLo     := balLL
+    else
+        balBars := balBars + 1
+        balHi   := balHH
+        balLo   := balLL
+else
+    inBalance := false
+    balBars   := 0
+
+// ---- Balance -> Imbalance transition ---------------------------------------
+// Compared against the PREVIOUS bar's balance boundaries, so the breakout bar
+// cannot widen the very range it is breaking out of.
+
+var int   imbDir = 0
+var int   imbBar = na
+var float imbLevel = na
+
+bool amtBarOk = confirmClose ? barstate.isconfirmed : true
+bool balMature = nz(balBars[1]) >= minBalanceBars
+bool volOk = not balNeedsVolume or (not na(rvol) and rvol >= rvolThr)
+float brkPad = dBreakAtr * nz(atr)
+
+bool imbUpNow = amtBarOk and balMature and not na(balHi[1]) and close > balHi[1] + brkPad and volOk
+bool imbDnNow = amtBarOk and balMature and not na(balLo[1]) and close < balLo[1] - brkPad and volOk
+
+if imbUpNow and not imbDnNow
+    imbDir   := 1
+    imbBar   := bar_index
+    imbLevel := balHi[1]
+    inBalance := false
+else if imbDnNow and not imbUpNow
+    imbDir   := -1
+    imbBar   := bar_index
+    imbLevel := balLo[1]
+    inBalance := false
+
+// ---- Acceptance / Rejection references -------------------------------------
+
+float refHi = na
+float refLo = na
+string refName = "-"
+if accRef == AcceptRef.prevValue and prvProf.ready
+    refHi := prvProf.vah
+    refLo := prvProf.val
+    refName := "prev VA"
+else if accRef == AcceptRef.curValue and curProf.ready
+    refHi := curProf.vah
+    refLo := curProf.val
+    refName := "current VA"
+else if accRef == AcceptRef.initialBalance and ibApplicable and not na(ibH)
+    refHi := ibH
+    refLo := ibL
+    refName := "IB"
+else if accRef == AcceptRef.openingRange and orApplicable and not na(orH)
+    refHi := orH
+    refLo := orL
+    refName := "OR"
+
+// ---- Acceptance ------------------------------------------------------------
+
+var int closesAbove = 0
+var int closesBelow = 0
+if na(refHi)
+    closesAbove := 0
+else
+    closesAbove := close > refHi ? closesAbove + 1 : 0
+if na(refLo)
+    closesBelow := 0
+else
+    closesBelow := close < refLo ? closesBelow + 1 : 0
+
+float timeAboveFrac = na(refHi) ? na : math.sum(close > refHi ? 1.0 : 0.0, accWindow) / accWindow
+float timeBelowFrac = na(refLo) ? na : math.sum(close < refLo ? 1.0 : 0.0, accWindow) / accWindow
+
+bool valueMigratedUp = not accNeedsMigration or (not na(devPoc) and not na(refHi) and devPoc > refHi)
+bool valueMigratedDn = not accNeedsMigration or (not na(devPoc) and not na(refLo) and devPoc < refLo)
+
+bool acceptUp = amtBarOk and closesAbove >= accCloses and nz(timeAboveFrac) * 100 >= accTimePct and valueMigratedUp
+bool acceptDn = amtBarOk and closesBelow >= accCloses and nz(timeBelowFrac) * 100 >= accTimePct and valueMigratedDn
+
+int amtAcceptDir = acceptUp and not acceptDn ? 1 : acceptDn and not acceptUp ? -1 : 0
+
+//@variable Strength of acceptance, 0..1: how far past the required number of
+//          closes, scaled by how much of the window was spent beyond the level.
+float amtAcceptMag = 0.0
+if amtAcceptDir > 0
+    amtAcceptMag := clamp(closesAbove / (accCloses * 2.0), 0.0, 1.0) * nz(timeAboveFrac)
+else if amtAcceptDir < 0
+    amtAcceptMag := clamp(closesBelow / (accCloses * 2.0), 0.0, 1.0) * nz(timeBelowFrac)
+
+// ---- Rejection -------------------------------------------------------------
+
+float barRange = math.max(high - low, syminfo.mintick)
+float upperWick = (high - math.max(open, close)) / barRange
+float lowerWick = (math.min(open, close) - low) / barRange
+
+bool rejectUp = amtBarOk and not na(refHi) and high > refHi and close < refHi and upperWick >= rejWick
+bool rejectDn = amtBarOk and not na(refLo) and low < refLo and close > refLo and lowerWick >= rejWick
+
+var int amtRejectDir = 0
+var int amtRejectBar = na
+if rejectUp and not rejectDn
+    amtRejectDir := 1
+    amtRejectBar := bar_index
+else if rejectDn and not rejectUp
+    amtRejectDir := -1
+    amtRejectBar := bar_index
+
+// ---- Initiative vs Responsive activity -------------------------------------
+// Dalton's definition, measured against the PREVIOUS value area. Uses the
+// directional volume of the active tier, so it is only as good as that tier -
+// which the dashboard always names.
+
+var float initBuyAcc  = 0.0
+var float initSellAcc = 0.0
+var float respBuyAcc  = 0.0
+var float respSellAcc = 0.0
+var float actAbsAcc   = 0.0
+
+if isNewDay
+    initBuyAcc  := 0.0
+    initSellAcc := 0.0
+    respBuyAcc  := 0.0
+    respSellAcc := 0.0
+    actAbsAcc   := 0.0
+
+if not na(deltaProxy) and prvProf.ready and not na(prvProf.vah)
+    float d = deltaProxy
+    float ad = math.abs(d)
+    actAbsAcc := actAbsAcc + ad
+    if d > 0
+        if close > prvProf.vah
+            initBuyAcc := initBuyAcc + ad
+        else if close < prvProf.val
+            respBuyAcc := respBuyAcc + ad
+    else if d < 0
+        if close < prvProf.val
+            initSellAcc := initSellAcc + ad
+        else if close > prvProf.vah
+            respSellAcc := respSellAcc + ad
+
+float initBuyNorm  = actAbsAcc > 0 ? initBuyAcc / actAbsAcc : na
+float initSellNorm = actAbsAcc > 0 ? initSellAcc / actAbsAcc : na
+float respBuyNorm  = actAbsAcc > 0 ? respBuyAcc / actAbsAcc : na
+float respSellNorm = actAbsAcc > 0 ? respSellAcc / actAbsAcc : na
+
+string activityState = "-"
+if actAbsAcc > 0
+    float mx = math.max(math.max(nz(initBuyNorm), nz(initSellNorm)), math.max(nz(respBuyNorm), nz(respSellNorm)))
+    if mx <= 0
+        activityState := "inside value"
+    else if mx == nz(initBuyNorm)
+        activityState := "initiative buying"
+    else if mx == nz(initSellNorm)
+        activityState := "initiative selling"
+    else if mx == nz(respBuyNorm)
+        activityState := "responsive buying"
+    else
+        activityState := "responsive selling"
+
+// ---- FACT summary ----------------------------------------------------------
+
+bool amtHasData = not na(refHi) or not na(refLo) or (ibApplicable and ibDone)
+
+string amtState = "-"
+if amtHasData
+    if amtRejectDir != 0 and not na(amtRejectBar) and bar_index - amtRejectBar <= 2
+        amtState := "Rejected " + (amtRejectDir > 0 ? "at " : "at ") + refName
+    else if amtAcceptDir != 0
+        amtState := "Accepted " + (amtAcceptDir > 0 ? "above " : "below ") + refName
+    else if imbDir != 0 and not na(imbBar) and bar_index - imbBar <= decayHalfLife * 2
+        amtState := "Imbalance " + (imbDir > 0 ? "up" : "down") + " " + str.tostring(bar_index - imbBar) + "b"
+    else if inBalance
+        amtState := "Balance " + str.tostring(balBars) + "b (" + str.tostring(balAgree) + "/3)"
+    else
+        amtState := trendM3 ? "Trending (ER " + str.tostring(nz(efficiency), "0.00") + ")" : "Neither"
+
+engAmt.ready := amtHasData
+if amtHasData
+    engAmt.summary := amtState + ", " + activityState + (openType != "-" ? ", " + openType : "")
+else
+    engAmt.summary := "no reference level yet"
+
+// ============================================================================
 //  11. CONTEXT ENGINE
 //      Turns engine FACTS into normalised component scores in [-1, +1].
 //      A component with no data reports valid = false and is excluded from the
@@ -2161,6 +2548,24 @@ float imbComposed = imbHasData ? clamp(imbUpScore - imbDnScore, -1.0, 1.0) : na
 //   scales it (flow without participation is weak evidence), and a footprint
 //   imbalance stack nudges it toward the stacked side. All three conventions
 //   are this layer's, not the engine's.
+//   AMT: acceptance beyond the reference dominates; an unconfirmed breakout of
+//   balance counts for half of it and decays; a rejection subtracts against the
+//   side it happened on; initiative activity tilts the result. Balance with no
+//   events is a genuine zero, not missing data - "the market is not going
+//   anywhere" IS the auction reading.
+float amtComposed = na
+if amtHasData
+    float a = 0.0
+    if amtAcceptDir != 0
+        a := amtAcceptDir * amtAcceptMag
+    else if imbDir != 0 and not na(imbBar)
+        a := imbDir * 0.5 * decayFactor(bar_index - imbBar, decayHalfLife)
+    if amtRejectDir != 0 and not na(amtRejectBar)
+        a := a - amtRejectDir * 0.6 * decayFactor(bar_index - amtRejectBar, decayHalfLife)
+    if not na(initBuyNorm)
+        a := a + 0.3 * ((initBuyNorm - initSellNorm) + 0.5 * (respBuyNorm - respSellNorm))
+    amtComposed := clamp(a, -1.0, 1.0)
+
 float volComposed = na
 if ofHasData
     float mag = math.min(math.abs(cumDeltaNorm) / 0.5, 1.0)
@@ -2173,12 +2578,24 @@ if ofHasData
 float liqRawHeld    = hold(liqComposed)
 float imbRawHeld    = hold(imbComposed)
 float volRawHeld    = hold(volComposed)
+float amtRawHeld    = hold(amtComposed)
 
 buildComponents() =>
     array<Component> c = array.new<Component>()
 
-    c.push(Component.new(name = "AMT", weight = wAmt, enabled = enAmt,
-         state = "-", reason = "engine arrives in P4"))
+    // --- AMT: live as of P4 ---
+    Component am = Component.new(name = "AMT", weight = wAmt, enabled = enAmt)
+    if not na(amtRawHeld)
+        am.valid  := true
+        am.raw    := clamp(amtRawHeld, -1.0, 1.0)
+        am.state  := amtState
+        am.approx := deltaTier != "BAR"
+        am.reason := "ref " + refName + ", " + activityState +
+             (openType != "-" ? ", " + openType : "")
+    else
+        am.state  := "-"
+        am.reason := "no reference level yet (needs a completed profile, IB or OR)"
+    c.push(am)
 
     // --- Volume Profile: live as of P1 ---
     Component vp = Component.new(name = "Volume Prof.", weight = wVp, enabled = enVp)
@@ -2333,7 +2750,7 @@ var array<float> prevContrib = array.new<float>(7, 0.0)
 //  13. DASHBOARD
 // ============================================================================
 
-var table dash = table.new(dashPosStr, 5, 32, bgcolor = cPanel,
+var table dash = table.new(dashPosStr, 5, 36, bgcolor = cPanel,
      border_color = cBorder, border_width = 1, frame_color = cBorder, frame_width = 1)
 
 //@function Writes one dashboard cell.
@@ -2342,7 +2759,7 @@ dcell(int col, int row, string txt, color txtColor, string align) =>
          text_halign = align, bgcolor = color.new(color.black, 100))
 
 renderDashboard() =>
-    table.clear(dash, 0, 0, 4, 31)
+    table.clear(dash, 0, 0, 4, 35)
     int r = 0
 
     // ---- header
@@ -2410,6 +2827,20 @@ renderDashboard() =>
     dcell(2, r, "VAH " + fmt(curProf.vah, format.mintick), cText, text.align_right)
     dcell(3, r, "VAL " + fmt(curProf.val, format.mintick), cText, text.align_right)
     dcell(4, r, "ATR " + fmt(atr, format.mintick), cMuted, text.align_right)
+    r += 1
+
+    dcell(0, r, "AMT", cMuted, text.align_left)
+    dcell(1, r, amtState, amtHasData ? cText : cMuted, text.align_left)
+    dcell(2, r, "IB", cMuted, text.align_right)
+    dcell(3, r, ibApplicable and not na(ibH) ? fmt(ibL, format.mintick) + "-" + fmt(ibH, format.mintick) : "n/a", ibApplicable ? cText : cMuted, text.align_right)
+    dcell(4, r, openType, openType == "-" ? cMuted : cAccent, text.align_right)
+    r += 1
+
+    dcell(0, r, "ACTIVITY", cMuted, text.align_left)
+    dcell(1, r, activityState, actAbsAcc > 0 ? cText : cMuted, text.align_left)
+    dcell(2, r, "BALANCE", cMuted, text.align_right)
+    dcell(3, r, inBalance ? str.tostring(balBars) + "b " + str.tostring(balAgree) + "/3" : "no", inBalance ? cText : cMuted, text.align_right)
+    dcell(4, r, na(vaOverlap) ? "" : "VA ovl " + str.tostring(vaOverlap * 100, "0") + "%", cMuted, text.align_right)
     r += 1
 
     dcell(0, r, "ORDER FLOW", cMuted, text.align_left)
@@ -2484,7 +2915,7 @@ renderDashboard() =>
 //  14. DEBUG FRAMEWORK
 // ============================================================================
 
-var table dbg = table.new(position.bottom_left, 3, 80, bgcolor = cPanel,
+var table dbg = table.new(position.bottom_left, 3, 100, bgcolor = cPanel,
      border_color = cBorder, border_width = 1, frame_color = cBorder, frame_width = 1)
 
 dbgRow(int row, string k, string v, color vc) =>
@@ -2498,7 +2929,7 @@ dbgEngineRow(int row, EngineState e) =>
     table.cell(dbg, 2, row, e.phase + " · " + e.summary, cMuted, text_size = size.tiny, text_halign = text.align_left)
 
 renderDebug() =>
-    table.clear(dbg, 0, 0, 2, 79)
+    table.clear(dbg, 0, 0, 2, 99)
     int r = 0
     table.cell(dbg, 0, r, "ACE DEBUG", cText, text_size = size.tiny, text_halign = text.align_left)
     table.cell(dbg, 1, r, ACE_VERSION, cAccent, text_size = size.tiny, text_halign = text.align_left)
@@ -2616,6 +3047,36 @@ renderDebug() =>
         r += 1
         dbgRow(r, "unfinished auction", (ofUnfTop ? "top " : "") + (ofUnfBot ? "bottom" : "") + (ofUnfTop or ofUnfBot ? "" : "none"), ofUnfTop or ofUnfBot ? cWarn : cMuted)
         r += 1
+        dbgRow(r, "session mins", na(minsIntoSession) ? "-" : str.tostring(minsIntoSession), cText)
+        r += 1
+        dbgRow(r, "IB / OR", (ibApplicable ? fmt(ibL, format.mintick) + "-" + fmt(ibH, format.mintick) + (ibDone ? " done" : " forming") : "n/a") + " | " + (orApplicable ? fmt(orL, format.mintick) + "-" + fmt(orH, format.mintick) : "n/a"), ibApplicable ? cText : cMuted)
+        r += 1
+        dbgRow(r, "open type", openType, openType == "-" ? cMuted : cAccent)
+        r += 1
+        dbgRow(r, "balance B1/B2/B3", (balM1 ? "1" : "0") + "/" + (balM2 ? "1" : "0") + "/" + (balM3 ? "1" : "0") + " agree " + str.tostring(balAgree), cText)
+        r += 1
+        dbgRow(r, "efficiency ratio", fmt(efficiency, "0.000") + (trendM3 ? " (trend)" : balM3 ? " (balance)" : ""), cText)
+        r += 1
+        dbgRow(r, "va overlap", fmt(vaOverlap, "0.000"), cText)
+        r += 1
+        dbgRow(r, "balance state", inBalance ? str.tostring(balBars) + "b " + fmt(balLo, format.mintick) + "-" + fmt(balHi, format.mintick) : "not in balance", inBalance ? cText : cMuted)
+        r += 1
+        dbgRow(r, "imbalance", imbDir == 0 ? "none" : (imbDir > 0 ? "up " : "down ") + fmt(imbLevel, format.mintick) + " " + str.tostring(bar_index - imbBar) + "b", imbDir == 0 ? cMuted : cWarn)
+        r += 1
+        dbgRow(r, "acc reference", refName + " " + fmt(refLo, format.mintick) + "-" + fmt(refHi, format.mintick), na(refHi) ? cMuted : cText)
+        r += 1
+        dbgRow(r, "acceptance", amtAcceptDir == 0 ? "none" : (amtAcceptDir > 0 ? "above " : "below ") + "mag " + fmt(amtAcceptMag, "0.00"), amtAcceptDir == 0 ? cMuted : cBull)
+        r += 1
+        dbgRow(r, "closes a/b", str.tostring(closesAbove) + " / " + str.tostring(closesBelow) + " need " + str.tostring(accCloses), cText)
+        r += 1
+        dbgRow(r, "time frac a/b", fmt(timeAboveFrac, "0.00") + " / " + fmt(timeBelowFrac, "0.00") + " need " + str.tostring(accTimePct / 100, "0.00"), cText)
+        r += 1
+        dbgRow(r, "rejection", amtRejectDir == 0 ? "none" : (amtRejectDir > 0 ? "upper " : "lower ") + str.tostring(bar_index - amtRejectBar) + "b", amtRejectDir == 0 ? cMuted : cWarn)
+        r += 1
+        dbgRow(r, "initiative b/s", fmt(initBuyNorm, "0.00") + " / " + fmt(initSellNorm, "0.00"), cText)
+        r += 1
+        dbgRow(r, "responsive b/s", fmt(respBuyNorm, "0.00") + " / " + fmt(respSellNorm, "0.00"), cText)
+        r += 1
         dbgRow(r, "flow divergence", ofDivergeUp ? "high unconfirmed" : ofDivergeDn ? "low unconfirmed" : "none", ofDivergeUp or ofDivergeDn ? cWarn : cMuted)
         r += 1
 
@@ -2645,7 +3106,7 @@ renderDebug() =>
 // ============================================================================
 
 const int BOX_LIMIT = 500
-const int BOX_RESERVE = 20          // headroom so a limit error can never fire
+const int BOX_RESERVE = 24          // headroom (incl. the AMT balance box)
 
 int fvgBoxBudget = showFvg ? resolvedMaxZones : 0
 int profBoxBudget = math.max(0, BOX_LIMIT - BOX_RESERVE - fvgBoxBudget)
@@ -2919,6 +3380,48 @@ renderLiquidity() =>
         label.set_textcolor(s1, v1 ? cWarn : color.new(cWarn, 100))
 
 // ============================================================================
+//  14e. AMT RENDER                                                        [P4]
+// ============================================================================
+
+var array<line> amtLines = array.new<line>()
+// Created at global scope: a Pine function cannot assign to a global, so the
+// box cannot be lazily created inside the renderer.
+var box balanceBox = box.new(bar_index, close, bar_index, close, border_width = 1,
+     xloc = xloc.bar_index)
+
+renderAmt() =>
+    bool on = showFacts and showIb
+    syncLines(amtLines, on ? 8 : 0)
+    if on
+        int x1 = nz(sessStartTime, time) == time ? bar_index : bar_index - nz(minsIntoSession, 0)
+        int xs = math.max(0, math.min(bar_index, x1))
+        int x2 = bar_index
+        bool ibOn = ibApplicable and not na(ibH)
+        bool orOn = orApplicable and not na(orH)
+        putLevel(amtLines, 0, ibOn, xs, x2, ibH, cWarn, 2, line.style_solid, true)
+        putLevel(amtLines, 1, ibOn, xs, x2, ibL, cWarn, 2, line.style_solid, true)
+        putLevel(amtLines, 2, ibOn and showIbExt, xs, x2, ibExt1U, color.new(cWarn, 45), 1, line.style_dashed, true)
+        putLevel(amtLines, 3, ibOn and showIbExt, xs, x2, ibExt1D, color.new(cWarn, 45), 1, line.style_dashed, true)
+        putLevel(amtLines, 4, ibOn and showIbExt, xs, x2, ibExt2U, color.new(cWarn, 70), 1, line.style_dotted, true)
+        putLevel(amtLines, 5, ibOn and showIbExt, xs, x2, ibExt2D, color.new(cWarn, 70), 1, line.style_dotted, true)
+        putLevel(amtLines, 6, orOn, xs, x2, orH, cAccent, 1, line.style_dashed, false)
+        putLevel(amtLines, 7, orOn, xs, x2, orL, cAccent, 1, line.style_dashed, false)
+
+    // Balance range: one box, moved in place, never recreated.
+    bool balOn = showFacts and showBalanceBox and showInterp and inBalance and
+         not na(balHi) and not na(balLo) and not na(balStart)
+    if balOn
+        box.set_lefttop(balanceBox, balStart, balHi)
+        box.set_rightbottom(balanceBox, bar_index, balLo)
+        box.set_bgcolor(balanceBox, color.new(cMuted, 92))
+        box.set_border_color(balanceBox, color.new(cMuted, 55))
+    else
+        box.set_lefttop(balanceBox, bar_index, close)
+        box.set_rightbottom(balanceBox, bar_index, close)
+        box.set_bgcolor(balanceBox, color.new(cMuted, 100))
+        box.set_border_color(balanceBox, color.new(cMuted, 100))
+
+// ============================================================================
 //  15. RENDER
 // ============================================================================
 
@@ -2934,16 +3437,17 @@ if barstate.islast
     renderStructure()
     renderImbalance()
     renderLiquidity()
+    renderAmt()
 
 if barstate.islast
     if showDash
         renderDashboard()
     else
-        table.clear(dash, 0, 0, 4, 31)
+        table.clear(dash, 0, 0, 4, 35)
     if dbgOn
         renderDebug()
     else
-        table.clear(dbg, 0, 0, 2, 79)
+        table.clear(dbg, 0, 0, 2, 99)
 
 // Keeps the pane scale stable and gives the script a plot to hang alerts on
 // in later phases. Invisible by design.

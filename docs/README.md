@@ -24,15 +24,17 @@ Volume Profile, VWAP и базовый Market Structure / SMC в **единый 
 | `P5-acceptance.md` | Отчёт и критерии приёмки фазы P5 (Structure) + pivot-lag и repaint-аудит |
 | `P6-acceptance.md` | Отчёт и критерии приёмки фазы P6 (Liquidity + Imbalance) + performance-аудит |
 | `P7-acceptance.md` | Фаза P7 (Volume / Order Flow) + аудит footprint, тарифов, realtime/history, repaint, performance |
+| `P4-acceptance.md` | Фаза P4 (AMT) + аудит взаимодействия движков, scoring, repaint, performance |
 
 ## Статус
 
 ✅ **P0** каркас · ✅ **P1** Profile · ✅ **P3** VWAP · ✅ **P5** Structure ·
-✅ **P6** Liquidity + Imbalance · ✅ **P7** Volume / Order Flow (v0.6.0-P7).
-⏳ Ожидается подтверждение перед **P4 (AMT Engine)** — последний незаполненный движок.
+✅ **P6** Liquidity + Imbalance · ✅ **P7** Volume / Order Flow · ✅ **P4** AMT (v0.7.0-P4).
 
-Активных компонентов scoring: **7 из 7** на инструменте с объёмом
-(компонент AMT показывает `NO DATA` с причиной `engine arrives in P4`).
+**Все семь движков реализованы.** Активных компонентов scoring: **7 из 7**
+на интрадей-инструменте с объёмом.
+
+⏳ Ожидается подтверждение перед **P8** (доводка Context/Scoring, `WHAT CHANGED`).
 Остальные честно показывают `NO DATA` с указанием причины, а не нейтральный ноль.
 
 ### Сборка (вариант B)
