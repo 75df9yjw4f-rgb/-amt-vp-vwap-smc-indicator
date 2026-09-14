@@ -1,0 +1,4 @@
+out/
+__pycache__/
+data/*.csv
+!data/SYNTHETIC-*.csv
