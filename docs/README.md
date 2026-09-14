@@ -25,6 +25,7 @@ Volume Profile, VWAP и базовый Market Structure / SMC в **единый 
 | `P6-acceptance.md` | Отчёт и критерии приёмки фазы P6 (Liquidity + Imbalance) + performance-аудит |
 | `P7-acceptance.md` | Фаза P7 (Volume / Order Flow) + аудит footprint, тарифов, realtime/history, repaint, performance |
 | `P4-acceptance.md` | Фаза P4 (AMT) + аудит взаимодействия движков, scoring, repaint, performance |
+| `P8-acceptance.md` | Фаза P8 (Change Explanation) + аудит scoring и корреляции, зафиксированный scope v1 |
 
 ## Статус
 
@@ -34,7 +35,13 @@ Volume Profile, VWAP и базовый Market Structure / SMC в **единый 
 **Все семь движков реализованы.** Активных компонентов scoring: **7 из 7**
 на интрадей-инструменте с объёмом.
 
-⏳ Ожидается подтверждение перед **P8** (доводка Context/Scoring, `WHAT CHANGED`).
+✅ **P8** Change Explanation (v0.8.0-P8).
+
+⏳ Ожидается подтверждение перед **P9** (алерты и доводка дашборда).
+
+### Scope ACE v1 — зафиксирован
+Order Blocks, Breakers, Mitigation Blocks, Inducement и прочие расширенные
+institutional/SMC-метки **не входят** в v1 и будут отдельным индикатором.
 Остальные честно показывают `NO DATA` с указанием причины, а не нейтральный ноль.
 
 ### Сборка (вариант B)
