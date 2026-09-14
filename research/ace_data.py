@@ -37,7 +37,10 @@ COLUMNS = {
     'bear':      ['bear'],
 }
 
-REQUIRED = ['open', 'high', 'low', 'close']
+# `open` and `volume` are never read: ATR uses high/low/previous close, the
+# baselines and the snapshot use close, and outcomes use high/low/close. They
+# stay optional so a hand-collected table does not have to carry them.
+REQUIRED = ['high', 'low', 'close']
 ATR_LEN = 14          # matches atrLen in ACE; see docs/15 section 2.2
 
 
