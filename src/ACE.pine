@@ -1,0 +1,899 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// at https://mozilla.org/MPL/2.0/
+// ============================================================================
+//  AUCTION CONTEXT ENGINE (ACE)
+//  AMT · Volume Profile · VWAP · Market Structure
+// ----------------------------------------------------------------------------
+//  All code in this script is original. No third-party Pine Script source has
+//  been copied or adapted. See docs/02-licensing.md for the licensing audit.
+// ----------------------------------------------------------------------------
+//  WHAT THIS IS:      a market-context / decision-support tool.
+//  WHAT THIS IS NOT:  a signal generator, a predictor, or a probability model.
+//                     It produces no BUY/SELL output and makes no accuracy claim.
+// ----------------------------------------------------------------------------
+//  ARCHITECTURE (docs/03-architecture.md)
+//
+//    DATA LAYER          ATR, RVOL, session detection, data-quality guards
+//    L3 FOOTPRINT        isolated, removable adapter (Premium/Ultimate only)
+//    PROFILE ENGINE      bins, POC, VA, HVN/LVN, developing values      [P1]
+//    AMT ENGINE          IB, OR, balance, acceptance, initiative        [P4]
+//    VWAP ENGINE         session/period/anchored + deviation bands      [P3]
+//    STRUCTURE ENGINE    swings, HH/HL/LH/LL, BOS, CHoCH, MSS           [P5]
+//    LIQUIDITY ENGINE    EQH/EQL, pools, sweeps                         [P6]
+//    IMBALANCE ENGINE    FVG, displacement, order blocks                [P6]
+//    ---------------------------------------------------------------------
+//    CONTEXT ENGINE      facts -> normalised component scores           [P8]
+//    SCORING ENGINE      weights, decay, bias, confidence               [P8]
+//    DASHBOARD           full explainability of every contribution      [P9]
+//
+//  INVARIANT #1 (FACT / INTERPRETATION)
+//    Engines above the line emit measurable values and states ONLY. They never
+//    decide "bullish" or "bearish". All interpretation lives in the Context and
+//    Scoring engines. This separation is enforced by file structure, not by
+//    discipline alone.
+//
+//  INVARIANT #2 (NO DATA != NEUTRAL)
+//    Every component carries a `valid` flag. An invalid component is removed
+//    from the denominator of the weighted average - it never drags the bias
+//    toward zero.
+//
+//  INVARIANT #3 (HONEST REPAINTING)
+//    No barmerge.lookahead_on. No future leak. Confirm-on-bar-close defaults ON.
+//    Pivot lag, zone backpainting and footprint source-drift are documented in
+//    the UI itself, not buried in the description. See docs/06-repainting.md.
+// ============================================================================
+
+//@version=6
+
+// The declaration statement must be the first statement in the script, so the
+// title is written literally here and mirrored by the constants below.
+indicator(
+     title               = "Auction Context Engine (ACE)",
+     shorttitle          = "ACE",
+     overlay             = true,
+     max_boxes_count     = 500,
+     max_lines_count     = 500,
+     max_labels_count    = 500,
+     max_polylines_count = 100,
+     max_bars_back       = 5000)
+
+// ============================================================================
+//  0. VERSION
+// ============================================================================
+const string ACE_NAME    = "Auction Context Engine"
+const string ACE_SHORT   = "ACE"
+const string ACE_VERSION = "0.1.0-P0"
+const string ACE_PHASE   = "P0 - framework skeleton"
+
+// ============================================================================
+//  1. ENUMS
+// ============================================================================
+
+//@enum Performance profile. Sets defaults for several subsystems at once.
+enum PerfMode
+    lite     = "Lite"
+    standard = "Standard"
+    pro      = "Pro"
+
+//@enum Source of the volume distribution used to build profiles.
+enum DataSource
+    auto      = "Auto (best available)"
+    barClose  = "L0 - Bar (close only)"
+    barDist   = "L1 - Bar (distributed)"
+    ltf       = "L2 - Lower timeframe"
+    footprint = "L3 - Footprint (Premium+)"
+
+//@enum How a bar's volume is spread across price when using bar-based models.
+enum DistModel
+    closeOnly = "Close only (M1)"
+    uniform   = "Uniform range (M2)"
+    weighted  = "OHLC weighted (M3)"
+
+//@enum Value Area construction algorithm.
+enum VaAlgo
+    classic = "Classic (pairwise from POC)"
+    sorted  = "Sorted descending"
+
+//@enum Balance / imbalance detection method.
+enum BalanceMode
+    atrRange   = "ATR range"
+    vaOverlap  = "Value Area overlap"
+    efficiency = "Efficiency ratio"
+    combined   = "Combined (2 of 3)"
+
+//@enum Break confirmation style for market structure.
+enum BreakMode
+    closeBreak = "Close through level"
+    wickBreak  = "Wick through level"
+
+//@enum Order block rule set. Convention-dependent by nature.
+enum ObRule
+    lastOpposite  = "Last opposite candle"
+    highestVolume = "Highest volume opposite candle"
+    bodyThreshold = "Body threshold"
+
+//@enum Directional volume proxy model.
+enum DeltaModel
+    closeDir = "D1 - Close direction"
+    closePos = "D2 - Close position in range"
+    ltfAgg   = "D3 - Lower timeframe aggregation"
+    fpNative = "D4 - Footprint (Premium+)"
+
+//@enum Colour theme.
+enum Theme
+    autoTheme = "Auto (follow chart)"
+    dark      = "Dark"
+    light     = "Light"
+
+//@enum Dashboard anchor position.
+enum DashPos
+    topLeft      = "Top left"
+    topCenter    = "Top center"
+    topRight     = "Top right"
+    middleLeft   = "Middle left"
+    middleRight  = "Middle right"
+    bottomLeft   = "Bottom left"
+    bottomCenter = "Bottom center"
+    bottomRight  = "Bottom right"
+
+//@enum Dashboard text size.
+enum DashSize
+    tiny   = "Tiny"
+    small  = "Small"
+    normal = "Normal"
+    large  = "Large"
+
+// ============================================================================
+//  2. USER-DEFINED TYPES
+// ============================================================================
+
+//@type A price-binned volume distribution over an arbitrary bar range.
+type Profile
+    float        lo        = na       // lower grid boundary
+    float        hi        = na       // upper grid boundary
+    int          bins      = 0
+    float        step      = na
+    array<float> vol       = na       // total volume per bin
+    array<float> volUp     = na       // directional volume, up
+    array<float> volDn     = na       // directional volume, down
+    array<int>   tpo       = na       // time-at-price counter (works without volume)
+    float        poc       = na
+    float        vah       = na
+    float        val       = na
+    float        total     = 0.0
+    int          startBar  = na
+    int          endBar    = na
+    string       model     = "none"   // data level actually used: BAR / LTF / FOOTPRINT
+    bool         ready     = false
+
+//@type A confirmed swing point.
+type Swing
+    float  price  = na
+    int    bar    = na
+    bool   isHigh = false
+    string tag    = ""                // HH | HL | LH | LL
+
+//@type A price zone: FVG, order block or liquidity pool.
+type Zone
+    float top       = na
+    float bot       = na
+    int   startBar  = na
+    bool  bull      = false
+    int   kind      = 0               // 0 = FVG, 1 = OB, 2 = liquidity
+    float mitigated = 0.0             // 0.0 .. 1.0
+    bool  active    = true
+    box   bx        = na
+    line  ln        = na
+
+//@type One input to the scoring engine. See INVARIANT #1 and #2.
+type Component
+    string name      = ""
+    string state     = "-"            // human-readable state, shown in dashboard
+    float  raw       = 0.0            // -1 .. +1, meaningful only when `valid`
+    float  weight    = 1.0
+    bool   enabled   = true           // user switch
+    bool   valid     = false          // has usable data  -> NO DATA != NEUTRAL
+    bool   approx    = false          // derived from a drifting source (marked ~)
+    int    barsSince = 0              // event age, for decay
+    string reason    = ""             // why this score, in words
+
+//@type Aggregate output of the scoring engine.
+type ScoreResult
+    float  bias         = 0.0
+    float  bull         = 0.0
+    float  bear         = 0.0
+    float  coverage     = 0.0
+    float  agreement    = 0.0
+    float  strength     = 0.0
+    float  confidence   = 0.0
+    int    activeCount  = 0
+    int    enabledCount = 0
+    string label        = "NO DATA"
+
+//@type Per-engine readiness and headline values, consumed by the dashboard.
+type EngineState
+    string name    = ""
+    bool   ready   = false
+    string phase   = ""
+    string summary = "not implemented"
+
+// ============================================================================
+//  3. INPUTS
+// ============================================================================
+
+const string G_GEN  = "1 · General"
+const string G_AMT  = "2 · Auction / AMT"
+const string G_VP   = "3 · Volume Profile"
+const string G_VWAP = "4 · VWAP"
+const string G_MS   = "5 · Market Structure"
+const string G_LIQ  = "6 · Liquidity"
+const string G_IMB  = "7 · Imbalance"
+const string G_OF   = "8 · Order Flow / Volume"
+const string G_CTX  = "9 · Context Engine"
+const string G_DASH = "10 · Dashboard"
+const string G_DBG  = "11 · Debug"
+
+// ---- GENERAL ---------------------------------------------------------------
+PerfMode perfMode = input.enum(PerfMode.standard, "Performance mode", group = G_GEN,
+     tooltip = "Sets defaults for bins, profile count, rendering and data source. " +
+               "Individual switches below always override the mode.")
+Theme themeIn = input.enum(Theme.autoTheme, "Theme", group = G_GEN)
+bool confirmClose = input.bool(true, "Confirm signals on bar close", group = G_GEN,
+     tooltip = "ON (recommended): every fact and the whole score are gated by " +
+               "barstate.isconfirmed, so nothing flickers intrabar. " +
+               "OFF: values update live inside the forming bar.")
+bool showFacts = input.bool(true, "Show FACT layer", group = G_GEN,
+     tooltip = "Objectively detectable events: swings, BOS, FVG, sweeps, POC/VA, VWAP.")
+bool showInterp = input.bool(true, "Show INTERPRETATION layer", group = G_GEN,
+     tooltip = "Convention-dependent constructs: balance, acceptance, order blocks, " +
+               "accumulation candidates. These depend on the rules you select.")
+int maxDrawBars = input.int(500, "Max bars to draw on", minval = 50, maxval = 5000, group = G_GEN,
+     tooltip = "Drawings are limited to the most recent N bars to stay inside " +
+               "the 500-object limits and keep the script fast.")
+
+// ---- AUCTION / AMT ---------------------------------------------------------
+float vaPercent = input.float(70.0, "Value Area %", minval = 1.0, maxval = 100.0, step = 1.0, group = G_AMT)
+VaAlgo vaAlgo = input.enum(VaAlgo.classic, "Value Area algorithm", group = G_AMT,
+     tooltip = "Classic: expands from the POC two bins at a time (CBOT convention). " +
+               "Sorted: takes the highest-volume bins until the target is met - simpler, " +
+               "but may select non-contiguous bins and will not match a standard profile.")
+int ibMinutes = input.int(60, "Initial Balance (minutes)", minval = 1, group = G_AMT)
+bool showIbExt = input.bool(true, "Show IB extensions (1x / 2x)", group = G_AMT)
+int orMinutes = input.int(15, "Opening Range (minutes)", minval = 1, group = G_AMT)
+BalanceMode balMode = input.enum(BalanceMode.combined, "Balance detection", group = G_AMT,
+     tooltip = "There is no canonical definition of balance. Combined requires " +
+               "2 of 3 methods to agree. See docs/04-algorithms.md section 3.3.")
+int balLookback = input.int(20, "Balance lookback (bars)", minval = 5, group = G_AMT)
+float balAtrMult = input.float(1.5, "Balance range (x ATR)", minval = 0.1, step = 0.1, group = G_AMT)
+int accCloses = input.int(2, "Acceptance: closes required", minval = 1, group = G_AMT,
+     tooltip = "Acceptance thresholds are conventional, not canonical.")
+float accTimePct = input.float(50.0, "Acceptance: time beyond level %", minval = 1.0, maxval = 100.0, group = G_AMT)
+float rejWick = input.float(0.6, "Rejection: wick ratio", minval = 0.1, maxval = 1.0, step = 0.05, group = G_AMT)
+
+// ---- VOLUME PROFILE --------------------------------------------------------
+DataSource dataSrcIn = input.enum(DataSource.auto, "Profile data source", group = G_VP,
+     tooltip = "Auto tries Footprint -> LTF -> Bar and reports what it actually used. " +
+               "L3 Footprint requires a TradingView Premium or Ultimate plan and is " +
+               "subject to source drift (see docs/08-footprint.md).")
+DistModel distModel = input.enum(DistModel.weighted, "Bar distribution model", group = G_VP,
+     tooltip = "Used for L0/L1, and as the fallback whenever LTF or footprint data " +
+               "is unavailable for a bar.")
+int binsIn = input.int(50, "Bins", minval = 10, maxval = 500, group = G_VP)
+int profileLookback = input.int(200, "Fixed lookback (bars)", minval = 20, group = G_VP)
+int profilesToShow = input.int(2, "Profiles to show", minval = 1, maxval = 5, group = G_VP)
+bool showPoc = input.bool(true, "Show POC", group = G_VP, inline = "lv")
+bool showVa = input.bool(true, "Show VAH / VAL", group = G_VP, inline = "lv")
+bool showDevPoc = input.bool(true, "Show developing POC / VA", group = G_VP)
+int devRecalcEvery = input.int(1, "Developing recalc every N bars", minval = 1, maxval = 50, group = G_VP)
+bool showNodes = input.bool(true, "Show HVN / LVN", group = G_VP, inline = "nd")
+float hvnThr = input.float(0.70, "HVN", minval = 0.1, maxval = 1.0, step = 0.05, group = G_VP, inline = "nd")
+float lvnThr = input.float(0.25, "LVN", minval = 0.01, maxval = 1.0, step = 0.05, group = G_VP, inline = "nd")
+bool showTpo = input.bool(false, "Show TPO (time-at-price) profile", group = G_VP,
+     tooltip = "Counts bars per price level instead of volume. Works on instruments " +
+               "with no volume data, and is closer to classic Market Profile.")
+
+// ---- VWAP ------------------------------------------------------------------
+bool useSessionVwap = input.bool(true, "Session VWAP", group = G_VWAP, inline = "v1")
+bool useWeeklyVwap = input.bool(false, "Weekly", group = G_VWAP, inline = "v1")
+bool useMonthlyVwap = input.bool(false, "Monthly", group = G_VWAP, inline = "v1")
+bool showVwapBands = input.bool(true, "Deviation bands", group = G_VWAP, inline = "v2")
+float vwapDev1 = input.float(1.0, "", minval = 0.1, step = 0.1, group = G_VWAP, inline = "v2")
+float vwapDev2 = input.float(2.0, "", minval = 0.1, step = 0.1, group = G_VWAP, inline = "v2")
+float vwapDev3 = input.float(3.0, "", minval = 0.1, step = 0.1, group = G_VWAP, inline = "v2")
+bool useAnchored1 = input.bool(false, "Anchored VWAP #1", group = G_VWAP)
+bool useAnchored2 = input.bool(false, "Anchored VWAP #2", group = G_VWAP)
+
+// ---- MARKET STRUCTURE ------------------------------------------------------
+int swingLen = input.int(5, "Swing length", minval = 1, maxval = 50, group = G_MS,
+     tooltip = "A swing is confirmed only after this many bars. That is a CONFIRMATION " +
+               "DELAY, not repainting - but it does mean the historical chart shows " +
+               "structure earlier than it could have been known live.")
+BreakMode breakMode = input.enum(BreakMode.closeBreak, "Structure confirmation", group = G_MS,
+     tooltip = "Close: the bar must close beyond the level (no intrabar flicker). " +
+               "Wick: triggers intrabar and can flicker until the bar closes.")
+bool showBos = input.bool(true, "BOS", group = G_MS, inline = "ms")
+bool showChoch = input.bool(true, "CHoCH", group = G_MS, inline = "ms")
+bool showMss = input.bool(true, "MSS", group = G_MS, inline = "ms")
+bool showSwingTags = input.bool(true, "Show HH / HL / LH / LL", group = G_MS)
+bool showPremiumDiscount = input.bool(true, "Show Premium / Discount / EQ", group = G_MS)
+bool showConfirmDelay = input.bool(false, "Mark actual detection bar", group = G_MS,
+     tooltip = "Draws a marker on the bar where the event was actually detectable, " +
+               "not only where it is drawn. Turn this on to see the real latency.")
+
+// ---- LIQUIDITY -------------------------------------------------------------
+bool showEqual = input.bool(true, "Equal Highs / Lows", group = G_LIQ)
+float eqTol = input.float(0.10, "Equal tolerance (x ATR)", minval = 0.01, maxval = 1.0, step = 0.01, group = G_LIQ)
+int eqMaxGap = input.int(50, "Max bars between equal points", minval = 2, group = G_LIQ)
+bool showPools = input.bool(true, "Liquidity pools", group = G_LIQ)
+bool showSweeps = input.bool(true, "Sweeps", group = G_LIQ)
+bool sweepNeedsChoch = input.bool(false, "Sweep requires following CHoCH", group = G_LIQ,
+     tooltip = "Far fewer false positives, at the cost of a delay of up to N bars.")
+int sweepConfirmBars = input.int(5, "Sweep confirmation window (bars)", minval = 1, group = G_LIQ)
+
+// ---- IMBALANCE -------------------------------------------------------------
+bool showFvg = input.bool(true, "Fair Value Gaps", group = G_IMB)
+float minFvgAtr = input.float(0.15, "Min FVG size (x ATR)", minval = 0.0, step = 0.05, group = G_IMB)
+bool hideMitigated = input.bool(true, "Hide fully mitigated zones", group = G_IMB)
+bool showDisp = input.bool(true, "Displacement", group = G_IMB)
+float dispBodyAtr = input.float(1.5, "Displacement body (x ATR)", minval = 0.1, step = 0.1, group = G_IMB)
+bool dispNeedsFvg = input.bool(true, "Displacement must create an FVG", group = G_IMB)
+bool showOb = input.bool(true, "Order Blocks", group = G_IMB,
+     tooltip = "CONVENTION-DEPENDENT. Competing definitions exist; the rule you pick " +
+               "below changes the result. Order blocks are also drawn on a past candle " +
+               "after the break confirms them (backpainting) - they were not knowable " +
+               "at that candle's close.")
+ObRule obRule = input.enum(ObRule.lastOpposite, "Order Block rule", group = G_IMB)
+int maxZones = input.int(25, "Max active zones", minval = 5, maxval = 200, group = G_IMB)
+
+// ---- ORDER FLOW / VOLUME ---------------------------------------------------
+DeltaModel deltaModelIn = input.enum(DeltaModel.closePos, "Directional volume model", group = G_OF,
+     tooltip = "D1/D2/D3 are PROXIES derived from price action, not order flow. " +
+               "D4 uses TradingView's footprint data, which is also classified by " +
+               "intrabar price direction - it is higher quality, but still not " +
+               "bid/ask aggressor data. True delta is not available in Pine Script.")
+int rvolLen = input.int(20, "Relative volume length", minval = 2, group = G_OF)
+float rvolThr = input.float(1.5, "Relative volume confirm threshold", minval = 0.1, step = 0.1, group = G_OF)
+int atrLen = input.int(14, "ATR length", minval = 1, group = G_OF)
+
+// ---- CONTEXT ENGINE --------------------------------------------------------
+bool enAmt = input.bool(true, "AMT", group = G_CTX, inline = "c1")
+float wAmt = input.float(2.0, "w", minval = 0.0, step = 0.1, group = G_CTX, inline = "c1")
+bool enVp = input.bool(true, "Volume Profile", group = G_CTX, inline = "c2")
+float wVp = input.float(2.0, "w", minval = 0.0, step = 0.1, group = G_CTX, inline = "c2")
+bool enStruct = input.bool(true, "Structure", group = G_CTX, inline = "c3")
+float wStruct = input.float(2.0, "w", minval = 0.0, step = 0.1, group = G_CTX, inline = "c3")
+bool enVwap = input.bool(true, "VWAP", group = G_CTX, inline = "c4")
+float wVwap = input.float(1.5, "w", minval = 0.0, step = 0.1, group = G_CTX, inline = "c4")
+bool enLiq = input.bool(true, "Liquidity", group = G_CTX, inline = "c5")
+float wLiq = input.float(1.0, "w", minval = 0.0, step = 0.1, group = G_CTX, inline = "c5")
+bool enImb = input.bool(true, "Imbalance", group = G_CTX, inline = "c6")
+float wImb = input.float(1.0, "w", minval = 0.0, step = 0.1, group = G_CTX, inline = "c6")
+bool enVol = input.bool(true, "Volume", group = G_CTX, inline = "c7")
+float wVol = input.float(0.5, "w", minval = 0.0, step = 0.1, group = G_CTX, inline = "c7")
+int decayHalfLife = input.int(20, "Event decay half-life (bars)", minval = 1, group = G_CTX,
+     tooltip = "Event components (BOS, sweep, FVG, displacement) lose half of their " +
+               "weight every N bars: score * 0.5 ^ (age / halfLife).")
+float thrNeutral = input.float(0.15, "Neutral threshold", minval = 0.0, maxval = 1.0, step = 0.01, group = G_CTX)
+float thrWeak = input.float(0.35, "Weak threshold", minval = 0.0, maxval = 1.0, step = 0.01, group = G_CTX)
+float thrStrong = input.float(0.60, "Strong threshold", minval = 0.0, maxval = 1.0, step = 0.01, group = G_CTX)
+float minConfidence = input.float(0.35, "Minimum confidence", minval = 0.0, maxval = 1.0, step = 0.01, group = G_CTX,
+     tooltip = "Below this, the context is reported as CONFLICTED regardless of bias. " +
+               "Confidence measures internal agreement of the model. It is NOT a " +
+               "probability that price will move in any direction.")
+
+// ---- DASHBOARD -------------------------------------------------------------
+bool showDash = input.bool(true, "Show dashboard", group = G_DASH)
+DashPos dashPosIn = input.enum(DashPos.topRight, "Position", group = G_DASH)
+DashSize dashSizeIn = input.enum(DashSize.small, "Size", group = G_DASH)
+bool dashBreakdown = input.bool(true, "Component breakdown", group = G_DASH)
+bool dashWeights = input.bool(true, "Weights and contributions", group = G_DASH)
+bool dashReason = input.bool(true, "Reason column", group = G_DASH)
+bool dashChanged = input.bool(true, "'What changed' row", group = G_DASH)
+
+// ---- DEBUG -----------------------------------------------------------------
+bool dbgOn = input.bool(false, "Debug mode", group = G_DBG,
+     tooltip = "Shows an engine/runtime panel. Development aid - keep it off in normal use.")
+bool dbgEngines = input.bool(true, "Engine readiness", group = G_DBG)
+bool dbgRuntime = input.bool(true, "Runtime and data quality", group = G_DBG)
+bool dbgAssert = input.bool(true, "Enable internal assertions", group = G_DBG,
+     tooltip = "Raises a runtime error on an internal inconsistency instead of " +
+               "silently producing wrong numbers.")
+
+// ============================================================================
+//  4. RESOLVED CONFIGURATION
+//     The performance mode only supplies DEFAULTS; explicit inputs win.
+// ============================================================================
+
+int resolvedBins = switch perfMode
+    PerfMode.lite     => math.min(binsIn, 24)
+    PerfMode.standard => math.min(binsIn, 150)
+    PerfMode.pro      => binsIn
+    => binsIn
+
+int resolvedProfiles = switch perfMode
+    PerfMode.lite     => 1
+    PerfMode.standard => math.min(profilesToShow, 2)
+    PerfMode.pro      => profilesToShow
+    => profilesToShow
+
+int resolvedMaxZones = switch perfMode
+    PerfMode.lite     => math.min(maxZones, 10)
+    PerfMode.standard => math.min(maxZones, 25)
+    PerfMode.pro      => maxZones
+    => maxZones
+
+int resolvedDevRecalc = switch perfMode
+    PerfMode.lite     => 0                       // developing values disabled
+    PerfMode.standard => math.max(devRecalcEvery, 5)
+    PerfMode.pro      => devRecalcEvery
+    => devRecalcEvery
+
+bool devEnabled = showDevPoc and resolvedDevRecalc > 0
+
+// ============================================================================
+//  5. THEME
+// ============================================================================
+
+bool isDark = switch themeIn
+    Theme.dark      => true
+    Theme.light     => false
+    Theme.autoTheme => color.r(chart.bg_color) + color.g(chart.bg_color) + color.b(chart.bg_color) < 382
+    => true
+
+color cText   = isDark ? #d1d4dc : #1f2229
+color cMuted  = isDark ? #787b86 : #6a6d78
+color cPanel  = isDark ? color.new(#12151c, 12) : color.new(#ffffff, 8)
+color cBorder = isDark ? #2a2e39 : #d6d9e0
+color cBull   = #26a69a
+color cBear   = #ef5350
+color cWarn   = #f7a35c
+color cAccent = #7e57c2
+
+string dashSizeStr = switch dashSizeIn
+    DashSize.tiny   => size.tiny
+    DashSize.small  => size.small
+    DashSize.normal => size.normal
+    DashSize.large  => size.large
+    => size.small
+
+string dashPosStr = switch dashPosIn
+    DashPos.topLeft      => position.top_left
+    DashPos.topCenter    => position.top_center
+    DashPos.topRight     => position.top_right
+    DashPos.middleLeft   => position.middle_left
+    DashPos.middleRight  => position.middle_right
+    DashPos.bottomLeft   => position.bottom_left
+    DashPos.bottomCenter => position.bottom_center
+    DashPos.bottomRight  => position.bottom_right
+    => position.top_right
+
+// ============================================================================
+//  6. CORE UTILITIES
+// ============================================================================
+
+//@function Clamps `v` into [lo, hi].
+clamp(float v, float lo, float hi) =>
+    math.max(lo, math.min(hi, v))
+
+//@function Exponential decay for event-based scores. age/halfLife -> 0.5^n.
+decayFactor(int age, int halfLife) =>
+    halfLife <= 0 or age <= 0 ? 1.0 : math.pow(0.5, age / (halfLife * 1.0))
+
+//@function Formats a float for dashboard display, returning "-" for na.
+fmt(float v, string f) =>
+    na(v) ? "-" : str.tostring(v, f)
+
+//@function Formats a signed score as "+0.00" / "-0.00".
+fmtSigned(float v) =>
+    na(v) ? "-" : (v >= 0 ? "+" : "") + str.tostring(v, "0.00")
+
+//@function Internal assertion. Fails loudly rather than producing silent nonsense.
+assert(bool condition, string message) =>
+    if dbgAssert and not condition
+        runtime.error("ACE internal assertion failed: " + message)
+
+// ============================================================================
+//  7. DATA LAYER
+// ============================================================================
+
+float atr = ta.atr(atrLen)
+float avgVol = ta.sma(volume, rvolLen)
+float rvol = avgVol > 0 ? volume / avgVol : na
+
+//@variable True when the instrument actually carries usable volume data.
+//          Drives INVARIANT #2: without it, VP and Volume components are INVALID,
+//          not neutral, and are excluded from the scoring denominator.
+bool volumeValid = not na(volume) and nz(avgVol) > 0
+
+bool isNewDay = timeframe.change("D")
+bool isNewWeek = timeframe.change("W")
+bool isNewMonth = timeframe.change("M")
+
+//@variable Bar is fully closed (or the user opted into intrabar updates).
+bool barConfirmed = confirmClose ? barstate.isconfirmed : true
+
+//@variable Directional volume proxy. NOT order flow - see docs/04-algorithms.md.
+float deltaProxy = na
+if volumeValid
+    if deltaModelIn == DeltaModel.closeDir
+        deltaProxy := close > open ? volume : close < open ? -volume : 0.0
+    else if deltaModelIn == DeltaModel.closePos
+        deltaProxy := high > low ? volume * (2.0 * (close - low) / (high - low) - 1.0) : 0.0
+    // D3 (LTF aggregation) and D4 (footprint) arrive in P7 and stay `na` until then.
+
+// ============================================================================
+//  8. L3 FOOTPRINT ADAPTER                                    [P7 - not active]
+// ----------------------------------------------------------------------------
+//  #region L3 FOOTPRINT ADAPTER
+//
+//  This region is the ONLY place in the script that may touch `request.footprint()`
+//  or the `footprint` / `volume_row` types. Everything else consumes it through
+//  the single entry point `fpBarContribution()`.
+//
+//  WHY IT IS ISOLATED (docs/08-footprint.md section 5):
+//    Merely CONTAINING a request.footprint() call makes the whole script unusable
+//    for Basic / Essential / Plus accounts - TradingView blocks it at the plan
+//    level, it does not simply return na. Deleting this one region therefore
+//    yields a valid all-plans build with zero changes anywhere else.
+//
+//  HARD CONSTRAINTS confirmed against the official v6 documentation:
+//    - exactly ONE request.footprint() call per script (a second raises a
+//      runtime error), and any request.security() whose expression depends on
+//      footprint data counts as that one call;
+//    - `ticks_per_row` is therefore a single global parameter;
+//    - the request always targets the CHART timeframe - session aggregation is
+//      done by our own Profile Engine, not by the footprint;
+//    - buy/sell volume is classified by INTRABAR PRICE DIRECTION, not by
+//      bid/ask aggressor. It is a high-quality proxy, not true order flow;
+//    - footprint data is "repainting by design": granularity degrades with bar
+//      age (1 tick -> 1s -> 1m -> 60m), so closed-bar values can differ after a
+//      chart reload. We call this SOURCE DRIFT and always surface it;
+//    - on timeframes >= 1D, footprint total volume can differ materially from
+//      the `volume` variable (EOD feeds include block/OTC trades).
+//
+//  P0 STATUS: interface only. No request.footprint() call exists yet, so this
+//  build runs on every TradingView plan.
+// ----------------------------------------------------------------------------
+
+//@variable Reports whether L3 data was actually obtained for this bar.
+//          P0 always returns false; P7 replaces the body only.
+fpAvailable() =>
+    false
+
+//@function Single entry point for L3. In P7 this fills the profile bins from
+//          footprint rows; until then it reports "no contribution made".
+//@returns  true when the profile bins were filled from footprint data.
+fpBarContribution(Profile p) =>
+    bool _unused = na(p)
+    false
+
+//  #endregion L3 FOOTPRINT ADAPTER
+// ============================================================================
+
+// ============================================================================
+//  9. DATA SOURCE RESOLUTION
+//     The dashboard must always report what was ACTUALLY used, never what was
+//     requested. Claiming a more precise source than was available would be the
+//     exact kind of dishonesty this project exists to avoid.
+// ============================================================================
+
+string resolvedSource = switch dataSrcIn
+    DataSource.footprint => fpAvailable() ? "FOOTPRINT" : "BAR (footprint unavailable)"
+    DataSource.ltf       => "BAR (LTF arrives in P7)"
+    DataSource.barDist   => "BAR"
+    DataSource.barClose  => "BAR"
+    DataSource.auto      => fpAvailable() ? "FOOTPRINT" : "BAR"
+    => "BAR"
+
+string resolvedDeltaSource = switch deltaModelIn
+    DeltaModel.closeDir => "D1 proxy"
+    DeltaModel.closePos => "D2 proxy"
+    DeltaModel.ltfAgg   => "D3 (P7)"
+    DeltaModel.fpNative => "D4 (P7)"
+    => "unknown"
+
+// ============================================================================
+//  10. ENGINE STATE OBJECTS
+//      Declared here so later phases only fill them in. Nothing below this line
+//      needs to change when an engine is implemented.
+// ============================================================================
+
+var Profile currentProfile = Profile.new()
+var Profile prevProfile    = Profile.new()
+
+var array<Swing> swings = array.new<Swing>()
+var array<Zone>  zones  = array.new<Zone>()
+
+var EngineState engProfile = EngineState.new("Profile",   false, "P1", "not implemented")
+var EngineState engAmt     = EngineState.new("AMT",       false, "P4", "not implemented")
+var EngineState engVwap    = EngineState.new("VWAP",      false, "P3", "not implemented")
+var EngineState engStruct  = EngineState.new("Structure", false, "P5", "not implemented")
+var EngineState engLiq     = EngineState.new("Liquidity", false, "P6", "not implemented")
+var EngineState engImb     = EngineState.new("Imbalance", false, "P6", "not implemented")
+var EngineState engVol     = EngineState.new("Volume",    false, "P7", "not implemented")
+
+// ============================================================================
+//  11. CONTEXT ENGINE
+//      Converts engine FACTS into normalised component scores.
+//      In P0 every component is registered but reports valid = false, which is
+//      the correct representation of "this engine does not exist yet".
+// ============================================================================
+
+//@function Builds the component list for the current bar.
+buildComponents() =>
+    array<Component> c = array.new<Component>()
+    c.push(Component.new(name = "AMT",        weight = wAmt,    enabled = enAmt,
+         state = "-", reason = "engine arrives in P4"))
+    c.push(Component.new(name = "Volume Prof.", weight = wVp,   enabled = enVp,
+         state = "-", reason = "engine arrives in P1"))
+    c.push(Component.new(name = "Structure",  weight = wStruct, enabled = enStruct,
+         state = "-", reason = "engine arrives in P5"))
+    c.push(Component.new(name = "VWAP",       weight = wVwap,   enabled = enVwap,
+         state = "-", reason = "engine arrives in P3"))
+    c.push(Component.new(name = "Liquidity",  weight = wLiq,    enabled = enLiq,
+         state = "-", reason = "engine arrives in P6"))
+    c.push(Component.new(name = "Imbalance",  weight = wImb,    enabled = enImb,
+         state = "-", reason = "engine arrives in P6"))
+    c.push(Component.new(name = "Volume",     weight = wVol,    enabled = enVol,
+         state = "-", reason = "engine arrives in P7"))
+    c
+
+// ============================================================================
+//  12. SCORING ENGINE
+//      bias      = SUM(w*s) / SUM(w)      over ACTIVE components only
+//      coverage  = active / enabled       -> how much of the model has data
+//      agreement = |SUM(w*s)| / SUM(w|s|) -> do the components agree
+//      strength  = SUM(w|s|) / SUM(w)     -> are the signals pronounced at all
+//      confidence = coverage * agreement * strength
+//
+//      Confidence is an INTERNAL MODEL AGREEMENT measure. It is not, and must
+//      never be presented as, a probability of price moving in any direction.
+// ============================================================================
+
+calcScore(array<Component> comps) =>
+    float wSum     = 0.0
+    float wsSum    = 0.0
+    float wAbsSSum = 0.0
+    float bullAcc  = 0.0
+    float bearAcc  = 0.0
+    int   active   = 0
+    int   enabled  = 0
+
+    for c in comps
+        if c.enabled and c.weight > 0
+            enabled += 1
+            if c.valid
+                active   += 1
+                wSum     += c.weight
+                wsSum    += c.weight * c.raw
+                wAbsSSum += c.weight * math.abs(c.raw)
+                bullAcc  += c.weight * math.max(c.raw, 0.0)
+                bearAcc  += c.weight * math.max(-c.raw, 0.0)
+
+    ScoreResult r = ScoreResult.new()
+    r.enabledCount := enabled
+    r.activeCount  := active
+
+    if wSum > 0
+        r.bias      := wsSum / wSum
+        r.bull      := bullAcc / wSum
+        r.bear      := bearAcc / wSum
+        r.coverage  := enabled > 0 ? active / (enabled * 1.0) : 0.0
+        r.agreement := wAbsSSum > 0 ? math.abs(wsSum) / wAbsSSum : 0.0
+        r.strength  := wAbsSSum / wSum
+        r.confidence := r.coverage * r.agreement * r.strength
+
+        float ab = math.abs(r.bias)
+        string dir = r.bias >= 0 ? "BULLISH" : "BEARISH"
+        r.label := ab < thrNeutral ? "NEUTRAL / BALANCE" :
+                   ab < thrWeak    ? "WEAK " + dir :
+                   ab < thrStrong  ? "MODERATE " + dir : "STRONG " + dir
+
+        if r.confidence < minConfidence and ab >= thrNeutral
+            r.label := "NEUTRAL - CONFLICTED"
+    else
+        // INVARIANT #2: no active component is NOT a neutral market read.
+        r.label := "NO DATA"
+
+    r
+
+array<Component> components = buildComponents()
+ScoreResult score = calcScore(components)
+
+// Previous-bar contributions, for the "what changed" explanation.
+var array<float> prevContrib = array.new<float>(7, 0.0)
+
+// ============================================================================
+//  13. DASHBOARD
+// ============================================================================
+
+var table dash = table.new(dashPosStr, 5, 22, bgcolor = cPanel,
+     border_color = cBorder, border_width = 1, frame_color = cBorder, frame_width = 1)
+
+//@function Writes one dashboard cell.
+dcell(int col, int row, string txt, color txtColor, string align) =>
+    table.cell(dash, col, row, txt, text_color = txtColor, text_size = dashSizeStr,
+         text_halign = align, bgcolor = color.new(color.black, 100))
+
+renderDashboard() =>
+    table.clear(dash, 0, 0, 4, 21)
+    int r = 0
+
+    // ---- header
+    dcell(0, r, ACE_SHORT + " · MARKET CONTEXT", cText, text.align_left)
+    dcell(4, r, syminfo.ticker + " · " + timeframe.period, cMuted, text.align_right)
+    r += 1
+
+    // ---- component breakdown
+    if dashBreakdown
+        dcell(0, r, "COMPONENT", cMuted, text.align_left)
+        dcell(1, r, "STATE", cMuted, text.align_left)
+        dcell(2, r, "SCORE", cMuted, text.align_right)
+        dcell(3, r, dashWeights ? "W" : "", cMuted, text.align_right)
+        dcell(4, r, dashWeights ? "CONTRIB" : "", cMuted, text.align_right)
+        r += 1
+
+        for c in components
+            if c.enabled
+                bool on = c.valid
+                color sc = not on ? cMuted : c.raw > 0 ? cBull : c.raw < 0 ? cBear : cText
+                float contrib = on and score.activeCount > 0 ? c.weight * c.raw : na
+                dcell(0, r, c.name + (c.approx ? " ~" : ""), on ? cText : cMuted, text.align_left)
+                dcell(1, r, on ? c.state : "NO DATA", on ? cText : cWarn, text.align_left)
+                dcell(2, r, on ? fmtSigned(c.raw) : "-", sc, text.align_right)
+                dcell(3, r, dashWeights ? str.tostring(c.weight, "0.0") : "", cMuted, text.align_right)
+                dcell(4, r, dashWeights ? (on ? fmtSigned(contrib) : "-") : "", sc, text.align_right)
+                r += 1
+
+    // ---- summary
+    bool hasData = score.activeCount > 0
+    color biasColor = not hasData ? cWarn : score.bias > 0 ? cBull : score.bias < 0 ? cBear : cText
+
+    dcell(0, r, "BULL", cMuted, text.align_left)
+    dcell(1, r, hasData ? str.tostring(score.bull, "0.00") : "-", cBull, text.align_left)
+    dcell(2, r, "BEAR", cMuted, text.align_right)
+    dcell(3, r, hasData ? str.tostring(score.bear, "0.00") : "-", cBear, text.align_right)
+    dcell(4, r, "", cMuted, text.align_right)
+    r += 1
+
+    dcell(0, r, "BIAS", cMuted, text.align_left)
+    dcell(1, r, hasData ? fmtSigned(score.bias) : "-", biasColor, text.align_left)
+    dcell(2, r, "CONFIDENCE", cMuted, text.align_right)
+    dcell(3, r, hasData ? str.tostring(math.round(score.confidence * 100)) + "%" : "-", cText, text.align_right)
+    dcell(4, r, str.tostring(score.activeCount) + "/" + str.tostring(score.enabledCount), cMuted, text.align_right)
+    r += 1
+
+    dcell(0, r, "CONTEXT", cMuted, text.align_left)
+    dcell(1, r, score.label, biasColor, text.align_left)
+    dcell(2, r, "", cText, text.align_right)
+    dcell(3, r, "", cText, text.align_right)
+    dcell(4, r, "", cText, text.align_right)
+    r += 1
+
+    if dashChanged
+        dcell(0, r, "WHAT CHANGED", cMuted, text.align_left)
+        dcell(1, r, hasData ? "-" : "no active components", cMuted, text.align_left)
+        dcell(2, r, "", cMuted, text.align_right)
+        dcell(3, r, "", cMuted, text.align_right)
+        dcell(4, r, "", cMuted, text.align_right)
+        r += 1
+
+    // ---- levels (always shown: makes the score hand-verifiable)
+    dcell(0, r, "LEVELS", cMuted, text.align_left)
+    dcell(1, r, "POC " + fmt(currentProfile.poc, format.mintick), cText, text.align_left)
+    dcell(2, r, "VAH " + fmt(currentProfile.vah, format.mintick), cText, text.align_right)
+    dcell(3, r, "VAL " + fmt(currentProfile.val, format.mintick), cText, text.align_right)
+    dcell(4, r, "ATR " + fmt(atr, format.mintick), cMuted, text.align_right)
+    r += 1
+
+    // ---- data quality (never optional: the user must always know the source)
+    dcell(0, r, "PROFILE DATA", cMuted, text.align_left)
+    dcell(1, r, resolvedSource, resolvedSource == "FOOTPRINT" ? cWarn : cText, text.align_left)
+    dcell(2, r, "VOLUME", cMuted, text.align_right)
+    dcell(3, r, volumeValid ? "OK" : "MISSING", volumeValid ? cBull : cWarn, text.align_right)
+    dcell(4, r, resolvedDeltaSource, cMuted, text.align_right)
+    r += 1
+
+    dcell(0, r, "INTEGRITY", cMuted, text.align_left)
+    dcell(1, r, confirmClose ? "Confirmed on bar close" : "Intrabar (live updates)",
+         confirmClose ? cBull : cWarn, text.align_left)
+    dcell(2, r, "No lookahead", cBull, text.align_right)
+    dcell(3, r, ACE_VERSION, cMuted, text.align_right)
+    dcell(4, r, ACE_PHASE, cMuted, text.align_right)
+    r += 1
+
+// ============================================================================
+//  14. DEBUG FRAMEWORK
+// ============================================================================
+
+var table dbg = table.new(position.bottom_left, 3, 24, bgcolor = cPanel,
+     border_color = cBorder, border_width = 1, frame_color = cBorder, frame_width = 1)
+
+dbgRow(int row, string k, string v, color vc) =>
+    table.cell(dbg, 0, row, k, text_color = cMuted, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(dbg, 1, row, v, text_color = vc, text_size = size.tiny, text_halign = text.align_left)
+
+dbgEngineRow(int row, EngineState e) =>
+    table.cell(dbg, 0, row, e.name, text_color = cMuted, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(dbg, 1, row, e.ready ? "READY" : "PENDING", e.ready ? cBull : cWarn,
+         text_size = size.tiny, text_halign = text.align_left)
+    table.cell(dbg, 2, row, e.phase + " · " + e.summary, cMuted, text_size = size.tiny, text_halign = text.align_left)
+
+renderDebug() =>
+    table.clear(dbg, 0, 0, 2, 23)
+    int r = 0
+    table.cell(dbg, 0, r, "ACE DEBUG", cText, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(dbg, 1, r, ACE_VERSION, cAccent, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(dbg, 2, r, ACE_PHASE, cMuted, text_size = size.tiny, text_halign = text.align_left)
+    r += 1
+
+    if dbgRuntime
+        dbgRow(r, "bar_index", str.tostring(bar_index), cText)
+        r += 1
+        dbgRow(r, "mintick", str.tostring(syminfo.mintick), cText)
+        r += 1
+        dbgRow(r, "tf seconds", str.tostring(timeframe.in_seconds()), cText)
+        r += 1
+        dbgRow(r, "volume valid", volumeValid ? "true" : "false", volumeValid ? cBull : cWarn)
+        r += 1
+        dbgRow(r, "bar confirmed", barConfirmed ? "true" : "false", barConfirmed ? cBull : cWarn)
+        r += 1
+        dbgRow(r, "profile source", resolvedSource, cText)
+        r += 1
+        dbgRow(r, "delta source", resolvedDeltaSource, cText)
+        r += 1
+        dbgRow(r, "delta value", fmt(deltaProxy, format.volume), cText)
+        r += 1
+        dbgRow(r, "rvol", fmt(rvol, "0.00"), cText)
+        r += 1
+        dbgRow(r, "perf mode", str.tostring(perfMode), cText)
+        r += 1
+        dbgRow(r, "bins / profiles", str.tostring(resolvedBins) + " / " + str.tostring(resolvedProfiles), cText)
+        r += 1
+        dbgRow(r, "max zones", str.tostring(resolvedMaxZones), cText)
+        r += 1
+        dbgRow(r, "developing", devEnabled ? "every " + str.tostring(resolvedDevRecalc) : "off", cText)
+        r += 1
+        dbgRow(r, "components", str.tostring(score.activeCount) + " active / " + str.tostring(score.enabledCount) + " enabled", cText)
+        r += 1
+
+    if dbgEngines
+        dbgEngineRow(r, engProfile)
+        r += 1
+        dbgEngineRow(r, engStruct)
+        r += 1
+        dbgEngineRow(r, engVwap)
+        r += 1
+        dbgEngineRow(r, engAmt)
+        r += 1
+        dbgEngineRow(r, engLiq)
+        r += 1
+        dbgEngineRow(r, engImb)
+        r += 1
+        dbgEngineRow(r, engVol)
+        r += 1
+
+// ============================================================================
+//  15. RENDER
+// ============================================================================
+
+// Guard: thresholds must be strictly increasing, otherwise the classification
+// silently collapses into a single band.
+assert(thrNeutral < thrWeak and thrWeak < thrStrong,
+     "context thresholds must satisfy neutral < weak < strong")
+
+bool inDrawWindow = bar_index > last_bar_index - maxDrawBars
+
+if barstate.islast
+    if showDash
+        renderDashboard()
+    else
+        table.clear(dash, 0, 0, 4, 21)
+    if dbgOn
+        renderDebug()
+    else
+        table.clear(dbg, 0, 0, 2, 23)
+
+// Keeps the pane scale stable and gives the script a plot to hang alerts on
+// in later phases. Invisible by design.
+plot(close, "ACE anchor", display = display.none, editable = false)
