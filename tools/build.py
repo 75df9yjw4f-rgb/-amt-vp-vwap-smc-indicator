@@ -117,6 +117,8 @@ def main() -> int:
     src = SRC.read_text(encoding="utf-8")
     targets = [(OUT_STD, make_standard(src)), (OUT_PRO, make_pro(src))]
 
+    placeholder = "REPLACE_WITH_YOUR_TRADINGVIEW_USERNAME" in src
+
     stale = []
     for path, content in targets:
         verify(content, path.name)
@@ -133,6 +135,12 @@ def main() -> int:
             print("out of date: " + ", ".join(stale))
             return 1
         print("builds are in sync with src/ACE.pine")
+
+    if placeholder:
+        # A warning, not an error: the placeholder is correct during development
+        # and only has to be resolved before publishing.
+        print("note: the copyright line still holds the placeholder - replace it "
+              "with your TradingView account name before publishing")
     return 0
 
 

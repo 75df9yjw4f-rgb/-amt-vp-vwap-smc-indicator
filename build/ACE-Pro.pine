@@ -1,5 +1,9 @@
-// This source code is subject to the terms of the Mozilla Public License 2.0
-// at https://mozilla.org/MPL/2.0/
+// This Source Code Form is subject to the terms of the Mozilla Public License,
+// v. 2.0. If a copy of the MPL was not distributed with this file, You can
+// obtain one at https://mozilla.org/MPL/2.0/.
+//
+// © REPLACE_WITH_YOUR_TRADINGVIEW_USERNAME
+//   ^^^ TradingView convention: put your account name here before publishing.
 // ============================================================================
 //  AUCTION CONTEXT ENGINE (ACE)
 //  AMT · Volume Profile · VWAP · Market Structure
@@ -62,8 +66,8 @@ indicator(
 // ============================================================================
 const string ACE_NAME    = "Auction Context Engine"
 const string ACE_SHORT   = "ACE"
-const string ACE_VERSION = "0.10.0-P11"
-const string ACE_PHASE   = "P11 - profiling and modes"
+const string ACE_VERSION = "1.0.0-rc"
+const string ACE_PHASE   = "release candidate"
 const string ACE_BUILD   = "PRO"   // rewritten to "STD" by tools/build.py
 
 // ============================================================================

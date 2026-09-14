@@ -29,6 +29,9 @@ Volume Profile, VWAP и базовый Market Structure / SMC в **единый 
 | `P9-acceptance.md` | Фаза P9 (Alerts) + аудит инертных input'ов, repaint и performance |
 | `REPAINT-TEST-REPORT.md` | **P10** — полный repaint-аудит P1–P9, performance-аудит, процедура ручной проверки |
 | `P11-acceptance.md` | Фаза P11 (профилирование и режимы) + измеренное сравнение Lite/Standard/Pro |
+| `P12-acceptance.md` | Фаза P12 (публикация) + финальный аудит и сводные Known Limitations |
+| `PUBLICATION.md` | Тексты описаний для TradingView + чек-лист House Rules |
+| `ATTRIBUTION.md` | Реестр заимствований (их нет) и источники знаний |
 
 ## Статус
 
@@ -39,9 +42,11 @@ Volume Profile, VWAP и базовый Market Structure / SMC в **единый 
 на интрадей-инструменте с объёмом.
 
 ✅ **P8** Change Explanation · ✅ **P9** Alerts (v0.9.0-P9) ·
-✅ **P10** Repaint-аудит · ✅ **P11** Профилирование и режимы (v0.10.0-P11).
+✅ **P10** Repaint-аудит · ✅ **P11** Профилирование и режимы ·
+✅ **P12** Публикация — **v1.0.0-rc**.
 
-⏳ Ожидается подтверждение перед **P12** (публикация).
+🏁 **Все фазы roadmap завершены.** Перед публикацией: заменить плейсхолдер
+копирайта, пересобрать, прогнать компиляцию и графические тесты в Pine Editor.
 
 Дефект Lite из P10 исправлен и проверен измерением (`tools/profile_sim.py`):
 `Profile.ready` наступает на баре 0 вместо 299.
