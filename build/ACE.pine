@@ -62,8 +62,8 @@ indicator(
 // ============================================================================
 const string ACE_NAME    = "Auction Context Engine"
 const string ACE_SHORT   = "ACE"
-const string ACE_VERSION = "0.8.0-P8"
-const string ACE_PHASE   = "P8 - change explanation"
+const string ACE_VERSION = "0.9.0-P9"
+const string ACE_PHASE   = "P9 - alerts"
 const string ACE_BUILD   = "STD"   // rewritten to "STD" by tools/build.py
 
 // ============================================================================
@@ -2834,6 +2834,12 @@ dcell(int col, int row, string txt, color txtColor, string align) =>
     table.cell(dash, col, row, txt, text_color = txtColor, text_size = dashSizeStr,
          text_halign = align, bgcolor = color.new(color.black, 100))
 
+//@function Same, with a hover tooltip. Used for the component rows so the
+//          "reason" text has somewhere to live without widening the table.
+dcellTip(int col, int row, string txt, color txtColor, string align, string tip) =>
+    table.cell(dash, col, row, txt, text_color = txtColor, text_size = dashSizeStr,
+         text_halign = align, bgcolor = color.new(color.black, 100), tooltip = tip)
+
 renderDashboard() =>
     table.clear(dash, 0, 0, 4, 35)
     int r = 0
@@ -2857,7 +2863,8 @@ renderDashboard() =>
                 bool on = c.valid
                 color sc = not on ? cMuted : c.raw > 0 ? cBull : c.raw < 0 ? cBear : cText
                 float contrib = on and score.activeCount > 0 ? c.weight * c.raw : na
-                dcell(0, r, c.name + (c.approx ? " ~" : ""), on ? cText : cMuted, text.align_left)
+                dcellTip(0, r, c.name + (c.approx ? " ~" : ""), on ? cText : cMuted, text.align_left,
+                     dashReason ? c.reason : "")
                 dcell(1, r, on ? c.state : "NO DATA", on ? cText : cWarn, text.align_left)
                 dcell(2, r, on ? fmtSigned(c.raw) : "-", sc, text.align_right)
                 dcell(3, r, dashWeights ? str.tostring(c.weight, "0.0") : "", cMuted, text.align_right)
@@ -3600,4 +3607,119 @@ plot(score.confidence, "CONFIDENCE", display = display.data_window, editable = f
 plot(score.bull,       "BULL",       display = display.data_window, editable = false)
 plot(score.bear,       "BEAR",       display = display.data_window, editable = false)
 
+// Displacement markers. The condition was already computed for MSS since P5;
+// until now the "Show displacement" switch had nothing to show.
+plotchar(showFacts and showDisp and dispNow and close > open ? 1 : na, "Displacement up",
+     "D", location.belowbar, cBull, size = size.tiny)
+plotchar(showFacts and showDisp and dispNow and close < open ? 1 : na, "Displacement down",
+     "D", location.abovebar, cBear, size = size.tiny)
+
 plot(close, "ACE anchor", display = display.none, editable = false)
+
+// ============================================================================
+//  16. ALERTS                                                             [P9]
+// ----------------------------------------------------------------------------
+//  FACT EVENTS ONLY - deliberately.
+//
+//  There is no alert on the context label, the bias crossing a threshold, or
+//  the confidence level. Those are INTERPRETATION: they depend on weights and
+//  thresholds the user sets themselves, so an alert on them would deliver a
+//  tunable opinion dressed as an event. Every condition below is something that
+//  either happened on the chart or did not.
+//
+//  All conditions are gated the same way the engines are: with
+//  `Confirm on bar close` on (the default) nothing fires inside an unconfirmed
+//  bar. Alerts evaluate on historical bars too, which is how TradingView shows
+//  where they would have triggered - that is the platform's behaviour, not a
+//  claim that the signal was knowable then. Anything carrying pivot lag
+//  (structure, liquidity) inherits that lag here as well.
+//
+//  `alertcondition` messages must be const strings, so they carry TradingView
+//  placeholders rather than computed values. Open the Data Window or the
+//  dashboard for the numbers behind any alert.
+// ============================================================================
+
+// ---- event flags (derived only; no engine state is modified) ---------------
+
+bool evNow = not na(lastEvBar) and lastEvBar == bar_index
+
+bool alBosUp   = evNow and takeDir ==  1 and lastEvType == EV_BOS
+bool alBosDn   = evNow and takeDir == -1 and lastEvType == EV_BOS
+bool alChochUp = evNow and takeDir ==  1 and lastEvType == EV_CHOCH
+bool alChochDn = evNow and takeDir == -1 and lastEvType == EV_CHOCH
+bool alMssUp   = evNow and takeDir ==  1 and lastEvType == EV_MSS
+bool alMssDn   = evNow and takeDir == -1 and lastEvType == EV_MSS
+
+// A sweep is "registered now" when the stored sweep bar changes. This covers
+// both modes: immediate, and confirmed-later by a CHoCH.
+bool sweepRegistered = not na(lastSweepBar) and (na(lastSweepBar[1]) or lastSweepBar != lastSweepBar[1])
+bool alSweepBsl = sweepRegistered and lastSweepSide ==  1
+bool alSweepSsl = sweepRegistered and lastSweepSide == -1
+
+bool alFvgUp = fvgUpNew and barConfirmed
+bool alFvgDn = fvgDnNew and barConfirmed
+
+bool alDispUp = dispNow and close > open and barConfirmed
+bool alDispDn = dispNow and close < open and barConfirmed
+
+bool alImbUp = imbUpNow and not imbDnNow
+bool alImbDn = imbDnNow and not imbUpNow
+
+bool alAcceptUp = amtAcceptDir ==  1 and nz(amtAcceptDir[1], 0) !=  1
+bool alAcceptDn = amtAcceptDir == -1 and nz(amtAcceptDir[1], 0) != -1
+bool alRejectUp = rejectUp
+bool alRejectDn = rejectDn
+
+bool alVwapUp = vwapValid and barConfirmed and ta.crossover(close, vwapVal)
+bool alVwapDn = vwapValid and barConfirmed and ta.crossunder(close, vwapVal)
+bool alBand3U = vwapValid and showVwapBands and barConfirmed and ta.crossover(close, bandU3)
+bool alBand3D = vwapValid and showVwapBands and barConfirmed and ta.crossunder(close, bandL3)
+
+bool alVahUp = curProf.ready and barConfirmed and ta.crossover(close, curProf.vah)
+bool alValDn = curProf.ready and barConfirmed and ta.crossunder(close, curProf.val)
+bool alPocUp = curProf.ready and barConfirmed and ta.crossover(close, curProf.poc)
+bool alPocDn = curProf.ready and barConfirmed and ta.crossunder(close, curProf.poc)
+
+// Footprint-only facts. In the Standard build these stay false for the life of
+// the script, so the alert list is identical in both builds and simply never
+// fires there - no separate UI, no missing entries.
+bool alStack = ofStackLen > 0 and nz(ofStackLen[1], 0) == 0 and barConfirmed
+bool alUnfinished = (ofUnfTop or ofUnfBot) and not (ofUnfTop[1] or ofUnfBot[1]) and barConfirmed
+
+// ---- alert conditions ------------------------------------------------------
+
+alertcondition(alBosUp,   "Structure: bullish BOS",   "ACE | Bullish BOS on {{ticker}} {{interval}} at {{close}}")
+alertcondition(alBosDn,   "Structure: bearish BOS",   "ACE | Bearish BOS on {{ticker}} {{interval}} at {{close}}")
+alertcondition(alChochUp, "Structure: bullish CHoCH", "ACE | Bullish CHoCH on {{ticker}} {{interval}} at {{close}}")
+alertcondition(alChochDn, "Structure: bearish CHoCH", "ACE | Bearish CHoCH on {{ticker}} {{interval}} at {{close}}")
+alertcondition(alMssUp,   "Structure: bullish MSS",   "ACE | Bullish MSS on {{ticker}} {{interval}} at {{close}}")
+alertcondition(alMssDn,   "Structure: bearish MSS",   "ACE | Bearish MSS on {{ticker}} {{interval}} at {{close}}")
+
+alertcondition(alSweepBsl, "Liquidity: buy-side sweep",  "ACE | Buy-side liquidity swept on {{ticker}} {{interval}} at {{close}}")
+alertcondition(alSweepSsl, "Liquidity: sell-side sweep", "ACE | Sell-side liquidity swept on {{ticker}} {{interval}} at {{close}}")
+
+alertcondition(alFvgUp, "Imbalance: bullish FVG", "ACE | Bullish FVG formed on {{ticker}} {{interval}} at {{close}}")
+alertcondition(alFvgDn, "Imbalance: bearish FVG", "ACE | Bearish FVG formed on {{ticker}} {{interval}} at {{close}}")
+alertcondition(alDispUp, "Imbalance: displacement up",   "ACE | Upward displacement on {{ticker}} {{interval}} at {{close}}")
+alertcondition(alDispDn, "Imbalance: displacement down", "ACE | Downward displacement on {{ticker}} {{interval}} at {{close}}")
+
+alertcondition(alImbUp, "AMT: balance broken upward",   "ACE | Balance broken upward on {{ticker}} {{interval}} at {{close}}")
+alertcondition(alImbDn, "AMT: balance broken downward", "ACE | Balance broken downward on {{ticker}} {{interval}} at {{close}}")
+alertcondition(alAcceptUp, "AMT: accepted above reference", "ACE | Price accepted above the reference level on {{ticker}} {{interval}}")
+alertcondition(alAcceptDn, "AMT: accepted below reference", "ACE | Price accepted below the reference level on {{ticker}} {{interval}}")
+alertcondition(alRejectUp, "AMT: rejected at upper reference", "ACE | Rejection at the upper reference level on {{ticker}} {{interval}}")
+alertcondition(alRejectDn, "AMT: rejected at lower reference", "ACE | Rejection at the lower reference level on {{ticker}} {{interval}}")
+
+alertcondition(alVwapUp, "VWAP: cross above", "ACE | Price crossed above VWAP on {{ticker}} {{interval}} at {{close}}")
+alertcondition(alVwapDn, "VWAP: cross below", "ACE | Price crossed below VWAP on {{ticker}} {{interval}} at {{close}}")
+alertcondition(alBand3U, "VWAP: above third upper band", "ACE | Price reached the third upper VWAP band on {{ticker}} {{interval}}")
+alertcondition(alBand3D, "VWAP: below third lower band", "ACE | Price reached the third lower VWAP band on {{ticker}} {{interval}}")
+
+alertcondition(alVahUp, "Profile: cross above VAH", "ACE | Price crossed above the Value Area High on {{ticker}} {{interval}}")
+alertcondition(alValDn, "Profile: cross below VAL", "ACE | Price crossed below the Value Area Low on {{ticker}} {{interval}}")
+alertcondition(alPocUp, "Profile: cross above POC", "ACE | Price crossed above the Point of Control on {{ticker}} {{interval}}")
+alertcondition(alPocDn, "Profile: cross below POC", "ACE | Price crossed below the Point of Control on {{ticker}} {{interval}}")
+
+alertcondition(alStack, "Order flow: imbalance stack", "ACE | Footprint imbalance stack on {{ticker}} {{interval}} (Pro build only)")
+alertcondition(alUnfinished, "Order flow: unfinished auction", "ACE | Unfinished auction at a bar extreme on {{ticker}} {{interval}} (Pro build only)")
+
