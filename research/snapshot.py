@@ -98,14 +98,19 @@ def build(history, sig, symbol="ANON-1", timeframe="TF-A"):
                           if sig['entry'] != sig['stop'] else None,
         },
         "structure": {
-            "last_confirmed_swing_high_dist_atr": _d(c.get('sw_hi_px'), c['close'], atr),
+            # Same convention as position_vs_value: close MINUS the level, so a
+            # positive number always means price is above it. The two blocks
+            # disagreed on this at first, which is precisely the kind of trap
+            # that silently inverts a reading.
+            "close_minus_last_swing_high_atr": _d(c['close'], c.get('sw_hi_px'), atr),
             "bars_since_that_swing_high_confirmed":
                 None if c.get('sw_hi_bar') is None else len(history) - 1 - c['sw_hi_bar'],
-            "last_confirmed_swing_low_dist_atr": _d(c.get('sw_lo_px'), c['close'], atr),
+            "close_minus_last_swing_low_atr": _d(c['close'], c.get('sw_lo_px'), atr),
             "bars_since_that_swing_low_confirmed":
                 None if c.get('sw_lo_bar') is None else len(history) - 1 - c['sw_lo_bar'],
-            "note": "reconstructed from the confirmation marker; known only from "
-                    "the confirmation bar onward, never from the pivot bar",
+            "note": "positive = price above the level. Reconstructed from the "
+                    "confirmation marker; known only from the confirmation bar "
+                    "onward, never from the pivot bar",
         },
         "displacement": {
             "last_direction": c.get('disp_dir'),
