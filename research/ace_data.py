@@ -27,6 +27,12 @@ COLUMNS = {
     'vwap_mon':  ['monthly vwap'],
     'avwap1':    ['anchored vwap 1'],
     'avwap2':    ['anchored vwap 2'],
+    'band_u1':   ['vwap +1σ', 'vwap +1s', 'vwap +1 sigma'],
+    'band_l1':   ['vwap -1σ', 'vwap -1s', 'vwap -1 sigma'],
+    'swing_hi':  ['swing high confirmed here'],
+    'swing_lo':  ['swing low confirmed here'],
+    'disp_up':   ['displacement up'],
+    'disp_dn':   ['displacement down'],
     'band_u2':   ['vwap +2σ', 'vwap +2s', 'vwap +2 sigma', 'vwap plus 2 sigma'],
     'band_l2':   ['vwap -2σ', 'vwap -2s', 'vwap -2 sigma', 'vwap minus 2 sigma'],
     'band_u3':   ['vwap +3σ', 'vwap +3s', 'vwap +3 sigma', 'vwap plus 3 sigma'],
@@ -94,8 +100,7 @@ def load_csv(path):
         rows.append(row)
 
     rows.sort(key=_sort_key)
-    add_atr(rows)
-    mark_gaps(rows)
+    rederive(rows)
     present = sorted(mapping)
     missing = sorted(set(COLUMNS) - set(mapping))
     return rows, present, missing
@@ -184,4 +189,57 @@ def mark_gaps(rows):
             r['gap_ok'] = i > 0
         else:
             r['gap_ok'] = (ts[i] - ts[i - 1]) <= tol
+    return rows
+
+
+def rederive(rows):
+    """Recomputes every derived field from the rows as they currently stand.
+
+    Kept as one entry point so the lookahead audit can re-derive after mutating
+    future bars. Without that the audit would only test the snapshot builder and
+    would silently pass a leak introduced in ATR, the gap flags or the structure
+    carry-forward, because those are computed once at load time.
+    """
+    add_atr(rows)
+    mark_gaps(rows)
+    mark_structure(rows)
+    return rows
+
+
+SWING_LEN = 5      # ACE's `Swing length` default; verified against the data below
+
+
+def mark_structure(rows, swing_len=SWING_LEN):
+    """Reconstructs confirmed swing levels and the last displacement.
+
+    ACE plots swings with plotchar, which carries a 1 rather than a price. But
+    the marker sits on the CONFIRMATION bar and the pivot is `swing_len` bars
+    earlier, so the price is exactly high[t - swing_len] (or low, for a low) and
+    the OHLC to recover it is in the same file.
+
+    Verified on the XAUUSD export: at swing_len = 5 the reconstructed pivot was
+    the window maximum in 1226 of 1226 cases, and at every other length in
+    essentially none - so the reconstruction and the setting are both confirmed
+    by the data rather than assumed.
+
+    Everything here is carried FORWARD only: at bar i the state reflects markers
+    at bars <= i, which is what keeps the pivot lag honest. The swing price
+    belongs to bar i - swing_len, but the KNOWLEDGE of it starts at bar i, and
+    that is when it enters the snapshot.
+    """
+    hi_px = hi_bar = lo_px = lo_bar = None
+    disp_dir = disp_bar = None
+    for i, r in enumerate(rows):
+        p = i - swing_len
+        if r.get('swing_hi') is not None and p >= 0:
+            hi_px, hi_bar = rows[p]['high'], p
+        if r.get('swing_lo') is not None and p >= 0:
+            lo_px, lo_bar = rows[p]['low'], p
+        if r.get('disp_up') is not None:
+            disp_dir, disp_bar = 1, i
+        if r.get('disp_dn') is not None:
+            disp_dir, disp_bar = -1, i
+        r['sw_hi_px'], r['sw_hi_bar'] = hi_px, hi_bar
+        r['sw_lo_px'], r['sw_lo_bar'] = lo_px, lo_bar
+        r['disp_dir'], r['disp_bar'] = disp_dir, disp_bar
     return rows

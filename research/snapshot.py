@@ -16,11 +16,11 @@ from baselines import regime, ace_context
 NOT_EXPORTABLE = [
     "component_contributions", "coverage_agreement_strength", "what_changed",
     "volume_profile_histogram", "static_poc_vah_val", "hvn_lvn",
-    "structure_state", "swing_prices", "hh_hl_lh_ll",
+    "structure_state", "hh_hl_lh_ll",
     "bos_level", "choch_level", "mss_level",
     "dealing_range", "premium_discount", "liquidity_levels", "eqh_eql",
     "liquidity_pools", "sweep_price", "fvg_boundaries", "fvg_mitigation",
-    "displacement_magnitude", "amt_state", "balance_range",
+    "amt_state", "balance_range",
     "acceptance_reference_and_magnitude", "initial_balance", "opening_range",
     "order_flow", "delta", "data_tier_l1_l2_l3",
 ]
@@ -96,6 +96,21 @@ def build(history, sig, symbol="ANON-1", timeframe="TF-A"):
             "planned_rr": round(abs(sig['target'] - sig['entry']) /
                                 abs(sig['entry'] - sig['stop']), 3)
                           if sig['entry'] != sig['stop'] else None,
+        },
+        "structure": {
+            "last_confirmed_swing_high_dist_atr": _d(c.get('sw_hi_px'), c['close'], atr),
+            "bars_since_that_swing_high_confirmed":
+                None if c.get('sw_hi_bar') is None else len(history) - 1 - c['sw_hi_bar'],
+            "last_confirmed_swing_low_dist_atr": _d(c.get('sw_lo_px'), c['close'], atr),
+            "bars_since_that_swing_low_confirmed":
+                None if c.get('sw_lo_bar') is None else len(history) - 1 - c['sw_lo_bar'],
+            "note": "reconstructed from the confirmation marker; known only from "
+                    "the confirmation bar onward, never from the pivot bar",
+        },
+        "displacement": {
+            "last_direction": c.get('disp_dir'),
+            "bars_since": None if c.get('disp_bar') is None
+                          else len(history) - 1 - c['disp_bar'],
         },
         "facts_unavailable": NOT_EXPORTABLE,
     }
