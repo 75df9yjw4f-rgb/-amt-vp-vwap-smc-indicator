@@ -28,6 +28,7 @@ Volume Profile, VWAP и базовый Market Structure / SMC в **единый 
 | `P8-acceptance.md` | Фаза P8 (Change Explanation) + аудит scoring и корреляции, зафиксированный scope v1 |
 | `P9-acceptance.md` | Фаза P9 (Alerts) + аудит инертных input'ов, repaint и performance |
 | `REPAINT-TEST-REPORT.md` | **P10** — полный repaint-аудит P1–P9, performance-аудит, процедура ручной проверки |
+| `P11-acceptance.md` | Фаза P11 (профилирование и режимы) + измеренное сравнение Lite/Standard/Pro |
 
 ## Статус
 
@@ -38,9 +39,12 @@ Volume Profile, VWAP и базовый Market Structure / SMC в **единый 
 на интрадей-инструменте с объёмом.
 
 ✅ **P8** Change Explanation · ✅ **P9** Alerts (v0.9.0-P9) ·
-✅ **P10** Repaint-аудит (кода не менял).
+✅ **P10** Repaint-аудит · ✅ **P11** Профилирование и режимы (v0.10.0-P11).
 
-⏳ Ожидается подтверждение перед **P11** (профилирование и режимы).
+⏳ Ожидается подтверждение перед **P12** (публикация).
+
+Дефект Lite из P10 исправлен и проверен измерением (`tools/profile_sim.py`):
+`Profile.ready` наступает на баре 0 вместо 299.
 
 **Repaint отсутствует.** Задержки, backpainting и source drift разведены и
 задокументированы в `REPAINT-TEST-REPORT.md`. Там же — находка аудита о

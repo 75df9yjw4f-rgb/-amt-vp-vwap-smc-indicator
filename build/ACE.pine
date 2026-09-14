@@ -62,8 +62,8 @@ indicator(
 // ============================================================================
 const string ACE_NAME    = "Auction Context Engine"
 const string ACE_SHORT   = "ACE"
-const string ACE_VERSION = "0.9.0-P9"
-const string ACE_PHASE   = "P9 - alerts"
+const string ACE_VERSION = "0.10.0-P11"
+const string ACE_PHASE   = "P11 - profiling and modes"
 const string ACE_BUILD   = "STD"   // rewritten to "STD" by tools/build.py
 
 // ============================================================================
@@ -293,8 +293,10 @@ const string G_DBG  = "11 · Debug"
 
 // ---- GENERAL ---------------------------------------------------------------
 PerfMode perfMode = input.enum(PerfMode.standard, "Performance mode", group = G_GEN,
-     tooltip = "Sets defaults for bins, profile count, rendering and data source. " +
-               "Individual switches below always override the mode.")
+     tooltip = "Caps the bin count, the number of profiles, the number of active " +
+               "zones, and how often the profile is recomputed. It does NOT change " +
+               "the distribution model, the data source or what is drawn - those " +
+               "are separate switches below, and they are what dominates the load.")
 Theme themeIn = input.enum(Theme.autoTheme, "Theme", group = G_GEN)
 bool confirmClose = input.bool(true, "Confirm signals on bar close", group = G_GEN,
      tooltip = "ON (recommended): every fact and the whole score are gated by " +
@@ -581,12 +583,33 @@ int resolvedMaxZones = switch perfMode
     => maxZones
 
 int resolvedDevRecalc = switch perfMode
-    PerfMode.lite     => 0                       // developing values disabled
+    PerfMode.lite     => 0                       // developing LINES disabled
     PerfMode.standard => math.max(devRecalcEvery, 5)
     PerfMode.pro      => devRecalcEvery
     => devRecalcEvery
 
+//@variable Whether the developing POC / VA LINES are drawn.
 bool devEnabled = showDevPoc and resolvedDevRecalc > 0
+
+//@variable How often POC / VAH / VAL are RECOMPUTED for logic.
+//
+//  This is deliberately independent of `devEnabled`. Gating the computation on
+//  the drawing switch was a real defect (REPAINT-TEST-REPORT.md section 7):
+//  `profFinalize()` is the only place POC/VA and `Profile.ready` are produced,
+//  so in Lite - where the lines are off - it ran only on the last bar. That
+//  left the Volume Profile component with NO DATA across all history, disabled
+//  the AMT "current value area" reference and its B2 balance method, silenced
+//  three profile-cross alerts, and (through `devPoc`) broke AMT acceptance
+//  whenever "require developing POC to migrate" was on.
+//
+//  Lite still recomputes less often than Standard - that is the point of the
+//  mode - but it now always has values. Cost at 24 bins every 10 bars is about
+//  5 operations per bar amortised.
+int profRecalcEvery = switch perfMode
+    PerfMode.lite     => 10
+    PerfMode.standard => math.max(devRecalcEvery, 5)
+    PerfMode.pro      => math.max(1, devRecalcEvery)
+    => math.max(1, devRecalcEvery)
 
 // ============================================================================
 //  5. THEME
@@ -1441,8 +1464,11 @@ var float devPoc = na
 var float devVah = na
 var float devVal = na
 
-bool devDue = devEnabled and (bar_index - curProf.startBar) % math.max(1, resolvedDevRecalc) == 0
-if curProf.bins > 0 and (devDue or barstate.islast)
+// The developing values are always maintained; only their PLOTS are gated by
+// `devEnabled`, so downstream logic (AMT value migration) never sees `na`
+// merely because the user turned the lines off.
+bool profDue = (bar_index - curProf.startBar) % math.max(1, profRecalcEvery) == 0
+if curProf.bins > 0 and (profDue or barstate.islast)
     profFinalize(curProf, useTpoSrc, vaAlgo, vaPercent, close)
     devPoc := curProf.poc
     devVah := curProf.vah
@@ -3061,7 +3087,9 @@ renderDebug() =>
         r += 1
         dbgRow(r, "max zones", str.tostring(resolvedMaxZones), cText)
         r += 1
-        dbgRow(r, "developing", devEnabled ? "every " + str.tostring(resolvedDevRecalc) : "off", cText)
+        dbgRow(r, "recalc / lines", "every " + str.tostring(profRecalcEvery) + "b / " + (devEnabled ? "on" : "off"), cText)
+        r += 1
+        dbgRow(r, "profile ready", curProf.ready ? "yes" : "no", curProf.ready ? cBull : cWarn)
         r += 1
         dbgRow(r, "bias / conf", fmtSigned(score.bias) + " / " + str.tostring(score.confidence, "0.00"), cText)
         r += 1
