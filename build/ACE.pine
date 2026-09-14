@@ -1691,6 +1691,8 @@ vwapApplyAnchor(VwapAcc a, AnchorMode mode, int anchorTime, int lookback) =>
              mode == AnchorMode.lastSwingLow ? lastSLBar : lastEvBar
         if na(ab)
             status := mode == AnchorMode.lastBos ? "no structure break yet" : "no confirmed swing yet"
+            true    // Pine requires every branch of an if/else to return the
+                    // same type; these terminators carry no logic.
         else
             int rawBack = bar_index - ab
             // A rebuild is a loop over `back` bars. Anchors far in the past are
@@ -1930,6 +1932,9 @@ var array<bool>  liqSwept   = array.new<bool>()
 
 //@function Registers a swing level, merging it into an existing level when the
 //          two are within tolerance. A merged level is an Equal High / Low.
+//@returns  true when the level merged into an existing one, false when a new
+//          level was created. Callers ignore it; it also gives both branches of
+//          the if/else the same return type, which Pine requires.
 addLiqLevel(float price, int bar, bool isHigh, float tol, int maxGap, int cap) =>
     int hit = -1
     if array.size(liqPrice) > 0
@@ -1944,6 +1949,7 @@ addLiqLevel(float price, int bar, bool isHigh, float tol, int maxGap, int cap) =
         array.set(liqPrice, hit, (array.get(liqPrice, hit) * (t - 1) + price) / t)
         array.set(liqTouch, hit, t)
         array.set(liqBar, hit, bar)
+        true
     else
         array.push(liqPrice, price)
         array.push(liqBar, bar)
@@ -1956,6 +1962,7 @@ addLiqLevel(float price, int bar, bool isHigh, float tol, int maxGap, int cap) =
             array.shift(liqTouch)
             array.shift(liqIsHigh)
             array.shift(liqSwept)
+        false
 
 float eqTolPrice = nz(atr) * eqTol
 
@@ -2025,6 +2032,7 @@ if sweepSideNow != 0
         sweepPendBar   := bar_index
         sweepPendSide  := sweepSideNow
         sweepPendLevel := sweepLevelNow
+        true    // branch type terminator, no logic
     else
         lastSweepBar   := bar_index
         lastSweepSide  := sweepSideNow
@@ -2223,10 +2231,12 @@ if isNewDay
     ibL      := low
     ibDone   := false
     sessOpen := open
+    true    // branch type terminator, no logic
 else if not ibDone and not na(minsIntoSession)
     if minsIntoSession < ibMinutes
         ibH := math.max(nz(ibH, high), high)
         ibL := math.min(nz(ibL, low), low)
+        true
     else
         ibDone := true
 
@@ -2254,6 +2264,7 @@ if isNewDay
     orTouchedBelow := false
     orMaxUp        := 0.0
     orMaxDn        := 0.0
+    true    // branch type terminator, no logic
 else if not orDone and not na(minsIntoSession)
     if minsIntoSession < orMinutes
         orH := math.max(nz(orH, high), high)
@@ -2265,6 +2276,7 @@ else if not orDone and not na(minsIntoSession)
             if low < sessOpen
                 orTouchedBelow := true
                 orMaxDn := math.max(orMaxDn, sessOpen - low)
+        true
     else
         orDone := true
 
@@ -3587,12 +3599,16 @@ if barstate.islast
 if barstate.islast
     if showDash
         renderDashboard()
+        true    // branch type terminator, no logic
     else
         table.clear(dash, 0, 0, 4, 35)
+        true
     if dbgOn
         renderDebug()
+        true
     else
         table.clear(dbg, 0, 0, 2, 99)
+        true
 
 // Keeps the pane scale stable and gives the script a plot to hang alerts on
 // in later phases. Invisible by design.
