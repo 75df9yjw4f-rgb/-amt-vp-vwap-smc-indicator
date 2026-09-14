@@ -9,6 +9,10 @@ compiler:
   2. a function referencing a global declared LATER in the file
      ("Undeclared identifier") - Pine resolves globals in source order
   3. positional/named argument mix-ups in the other drawing calls
+  4. stateful ta.*() calls inside a conditional branch or behind and/or/?: -
+     Pine needs them evaluated on EVERY bar or their series state falls behind
+  5. functions approaching the 254 external-element limit Pine applies per
+     function
 
 if/else and switch branch-type compatibility lives in tools/typecheck.py.
 
@@ -163,6 +167,43 @@ def main(path):
     # named arguments from genuinely undeclared names, and reported hundreds of
     # false positives. The FORWARD_REF check above covers the case that actually
     # bit us, which is the one Pine reports as "Undeclared identifier".
+
+    # ---- 4. stateful ta.*() that may not run on every bar --------------
+    STATEFUL = ('crossover','crossunder','highestbars','lowestbars','vwap','barssince',
+                'change','valuewhen','cum','sma','ema','rma','atr','highest','lowest',
+                'pivothigh','pivotlow','rising','falling','mom','roc','stdev')
+    for i, l in enumerate(code):
+        for m in re.finditer(r'\bta\.(\w+)\s*\(', l):
+            if m.group(1) not in STATEFUL:
+                continue
+            indented = len(l) - len(l.lstrip()) > 0
+            before = l[:m.start()]
+            guarded = bool(re.search(r'(\?|\band\b|\bor\b)\s*$', before.rstrip()))
+            if indented or guarded:
+                why = 'conditional scope' if indented else 'behind and/or/?: (short-circuit)'
+                problems.append(('TA_SCOPE', i + 1,
+                    f"ta.{m.group(1)}() in {why} - hoist it to global scope"))
+
+    # ---- 5. external elements per function -----------------------------
+    KW2 = KEYWORDS | {'to', 'by'}
+    for fname, (fline, params) in fns.items():
+        pnames = {p.strip().split()[-1] for p in params.split(',') if p.strip()}
+        loc, body, j = set(pnames), [], fline + 1
+        while j < len(code):
+            if code[j].strip() and indent(code[j]) == 0: break
+            body.append(code[j]); j += 1
+        for l in body:
+            for rx in (r'^\s+(?:var\s+)?(?:\w+(?:<[^>]+>)?)\s+(\w+)\s*=', r'^\s+for\s+(\w+)'):
+                m = re.match(rx, l)
+                if m: loc.add(m.group(1))
+        txt = '\n'.join(body)
+        toks = re.findall(r'(?<![\w.])([A-Za-z_]\w*(?:\.\w+)?)', txt)
+        ext = [t for t in toks if t.split('.')[0] not in loc and t.split('.')[0] not in KW2]
+        # Calibrated against a reported 265/254 for a body measuring 557 here.
+        est = int(len(ext) * 265 / 557)
+        if est > 200:
+            problems.append(('EXTERNAL_ELEMENTS', fline + 1,
+                f"{fname}() ~{est} external elements (limit 254) - split it"))
 
     # ---- report ------------------------------------------------------------
     seen = set()

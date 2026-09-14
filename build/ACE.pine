@@ -1645,7 +1645,11 @@ vwapAdd(accMonthly, vwapSrc, volume)
 
 //@function Applies one anchor mode to an accumulator.
 //@returns  A status string: "ok", or why the anchor produced no data.
-vwapApplyAnchor(VwapAcc a, AnchorMode mode, int anchorTime, int lookback) =>
+//@param    hhBack/llBack Bars back to the extreme, precomputed on EVERY bar.
+//          ta.highestbars()/ta.lowestbars() are stateful and must not sit
+//          inside a conditional branch - on bars where another anchor mode was
+//          selected they would simply not run.
+vwapApplyAnchor(VwapAcc a, AnchorMode mode, int anchorTime, int hhBack, int llBack) =>
     string status = "ok"
     if mode == AnchorMode.dateTime
         if time >= anchorTime and (na(time[1]) or time[1] < anchorTime)
@@ -1670,7 +1674,7 @@ vwapApplyAnchor(VwapAcc a, AnchorMode mode, int anchorTime, int lookback) =>
             vwapReset(a)
         vwapAdd(a, vwapSrc, volume)
     else if mode == AnchorMode.highestHigh
-        int back = int(math.abs(nz(ta.highestbars(high, lookback), 0)))
+        int back = hhBack
         int ab = bar_index - back
         if na(a.srcAnchor) or a.srcAnchor != ab
             a.srcAnchor := ab
@@ -1678,7 +1682,7 @@ vwapApplyAnchor(VwapAcc a, AnchorMode mode, int anchorTime, int lookback) =>
         else
             vwapAdd(a, vwapSrc, volume)
     else if mode == AnchorMode.lowestLow
-        int back = int(math.abs(nz(ta.lowestbars(low, lookback), 0)))
+        int back = llBack
         int ab = bar_index - back
         if na(a.srcAnchor) or a.srcAnchor != ab
             a.srcAnchor := ab
@@ -1711,8 +1715,15 @@ vwapApplyAnchor(VwapAcc a, AnchorMode mode, int anchorTime, int lookback) =>
                 vwapAdd(a, vwapSrc, volume)
     status
 
-string anc1Status = useAnchored1 ? vwapApplyAnchor(accAnc1, anc1Mode, anc1Time, anc1Lookback) : "off"
-string anc2Status = useAnchored2 ? vwapApplyAnchor(accAnc2, anc2Mode, anc2Time, anc2Lookback) : "off"
+// Evaluated unconditionally on every bar so their series state stays correct,
+// then handed to the anchor helper as plain integers.
+int anc1HhBack = int(math.abs(nz(ta.highestbars(high, anc1Lookback), 0)))
+int anc1LlBack = int(math.abs(nz(ta.lowestbars(low,  anc1Lookback), 0)))
+int anc2HhBack = int(math.abs(nz(ta.highestbars(high, anc2Lookback), 0)))
+int anc2LlBack = int(math.abs(nz(ta.lowestbars(low,  anc2Lookback), 0)))
+
+string anc1Status = useAnchored1 ? vwapApplyAnchor(accAnc1, anc1Mode, anc1Time, anc1HhBack, anc1LlBack) : "off"
+string anc2Status = useAnchored2 ? vwapApplyAnchor(accAnc2, anc2Mode, anc2Time, anc2HhBack, anc2LlBack) : "off"
 
 // ---- primary VWAP selection ------------------------------------------------
 
@@ -1786,7 +1797,9 @@ string vwapPos = not vwapValid ? "-" : close > vwapVal ? "Above" : close < vwapV
 // `ta.vwap` is the reference implementation. Keeping a live difference readout
 // in the debug panel makes the accuracy claim verifiable by the user instead
 // of something they have to take on trust.
-float refVwap = volumeValid ? ta.vwap(hlc3) : na
+// ta.vwap() is stateful: evaluate it every bar, then gate the VALUE.
+float refVwapRaw = ta.vwap(hlc3)
+float refVwap = volumeValid ? refVwapRaw : na
 float vwapDiffTicks = not na(refVwap) and accSession.valid and syminfo.mintick > 0 ?
      math.abs(accSession.vwap - refVwap) / syminfo.mintick : na
 
@@ -2903,15 +2916,14 @@ dcellTip(int col, int row, string txt, color txtColor, string align, string tip)
     table.cell(dash, col, row, txt, text_color = txtColor, text_size = dashSizeStr,
          text_halign = align, bgcolor = color.new(color.black, 100), tooltip = tip)
 
-renderDashboard() =>
-    table.clear(dash, 0, 0, 4, 35)
-    int r = 0
-
+//@function Dashboard rows, part 1 of 4. Split for the same reason as
+//          the debug blocks: the 254 external-element limit is per function.
+dashHeader(int r0) =>
+    int r = r0
     // ---- header
     dcell(0, r, ACE_SHORT + " · MARKET CONTEXT", cText, text.align_left)
     dcell(4, r, syminfo.ticker + " · " + timeframe.period, cMuted, text.align_right)
     r += 1
-
     // ---- component breakdown
     if dashBreakdown
         dcell(0, r, "COMPONENT", cMuted, text.align_left)
@@ -2920,7 +2932,6 @@ renderDashboard() =>
         dcell(3, r, dashWeights ? "W" : "", cMuted, text.align_right)
         dcell(4, r, dashWeights ? "CONTRIB" : "", cMuted, text.align_right)
         r += 1
-
         for c in components
             if c.enabled
                 bool on = c.valid
@@ -2933,32 +2944,33 @@ renderDashboard() =>
                 dcell(3, r, dashWeights ? str.tostring(c.weight, "0.0") : "", cMuted, text.align_right)
                 dcell(4, r, dashWeights ? (on ? fmtSigned(contrib) : "-") : "", sc, text.align_right)
                 r += 1
+    r
 
+//@function Dashboard rows, part 2 of 4. Split for the same reason as
+//          the debug blocks: the 254 external-element limit is per function.
+dashSummary(int r0) =>
+    int r = r0
     // ---- summary
     bool hasData = score.activeCount > 0
     color biasColor = not hasData ? cWarn : score.bias > 0 ? cBull : score.bias < 0 ? cBear : cText
-
     dcell(0, r, "BULL", cMuted, text.align_left)
     dcell(1, r, hasData ? str.tostring(score.bull, "0.00") : "-", cBull, text.align_left)
     dcell(2, r, "BEAR", cMuted, text.align_right)
     dcell(3, r, hasData ? str.tostring(score.bear, "0.00") : "-", cBear, text.align_right)
     dcell(4, r, "", cMuted, text.align_right)
     r += 1
-
     dcell(0, r, "BIAS", cMuted, text.align_left)
     dcell(1, r, hasData ? fmtSigned(score.bias) : "-", biasColor, text.align_left)
     dcell(2, r, "CONFIDENCE", cMuted, text.align_right)
     dcell(3, r, hasData ? str.tostring(math.round(score.confidence * 100)) + "%" : "-", cText, text.align_right)
     dcell(4, r, str.tostring(score.activeCount) + "/" + str.tostring(score.enabledCount), cMuted, text.align_right)
     r += 1
-
     dcell(0, r, "CONTEXT", cMuted, text.align_left)
     dcell(1, r, score.label, biasColor, text.align_left)
     dcell(2, r, "", cText, text.align_right)
     dcell(3, r, "", cText, text.align_right)
     dcell(4, r, "", cText, text.align_right)
     r += 1
-
     if dashChanged
         string chgText = "no change"
         if not hasData
@@ -2986,7 +2998,15 @@ renderDashboard() =>
              math.abs(biasDelta) < 0.005 ? cMuted : biasDelta > 0 ? cBull : cBear, text.align_right)
         dcell(4, r, "", cMuted, text.align_right)
         r += 1
+    r
 
+//@function Dashboard rows, part 3 of 4. Split for the same reason as
+//          the debug blocks: the 254 external-element limit is per function.
+//@function Dashboard rows, part 3a. Split again purely for the per-function
+//          external-element limit; rows and order are unchanged.
+dashLevels(int r0) =>
+    int r = r0
+    int r = r0
     // ---- levels (always shown: makes the score hand-verifiable)
     dcell(0, r, "LEVELS", cMuted, text.align_left)
     dcell(1, r, "POC " + fmt(curProf.poc, format.mintick), cText, text.align_left)
@@ -2994,42 +3014,41 @@ renderDashboard() =>
     dcell(3, r, "VAL " + fmt(curProf.val, format.mintick), cText, text.align_right)
     dcell(4, r, "ATR " + fmt(atr, format.mintick), cMuted, text.align_right)
     r += 1
-
     dcell(0, r, "AMT", cMuted, text.align_left)
     dcell(1, r, amtState, amtHasData ? cText : cMuted, text.align_left)
     dcell(2, r, "IB", cMuted, text.align_right)
     dcell(3, r, ibApplicable and not na(ibH) ? fmt(ibL, format.mintick) + "-" + fmt(ibH, format.mintick) : "n/a", ibApplicable ? cText : cMuted, text.align_right)
     dcell(4, r, openType, openType == "-" ? cMuted : cAccent, text.align_right)
     r += 1
-
     dcell(0, r, "ACTIVITY", cMuted, text.align_left)
     dcell(1, r, activityState, actAbsAcc > 0 ? cText : cMuted, text.align_left)
     dcell(2, r, "BALANCE", cMuted, text.align_right)
     dcell(3, r, inBalance ? str.tostring(balBars) + "b " + str.tostring(balAgree) + "/3" : "no", inBalance ? cText : cMuted, text.align_right)
     dcell(4, r, na(vaOverlap) ? "" : "VA ovl " + str.tostring(vaOverlap * 100, "0") + "%", cMuted, text.align_right)
     r += 1
-
     dcell(0, r, "ORDER FLOW", cMuted, text.align_left)
     dcell(1, r, ofState, ofHasData ? cText : cMuted, text.align_left)
     dcell(2, r, "TIER", cMuted, text.align_right)
     dcell(3, r, deltaTier, deltaTier == "BAR" ? cMuted : cWarn, text.align_right)
     dcell(4, r, ofUnfTop or ofUnfBot ? "unfinished " + (ofUnfTop ? "hi" : "") + (ofUnfBot ? " lo" : "") : "", cWarn, text.align_right)
     r += 1
+    r
 
+//@function Dashboard rows, part 3b.
+dashLevels2(int r0) =>
+    int r = r0
     dcell(0, r, "LIQUIDITY", cMuted, text.align_left)
     dcell(1, r, liqState, liqHasData ? cText : cMuted, text.align_left)
     dcell(2, r, "FVG", cMuted, text.align_right)
     dcell(3, r, str.tostring(imbActive) + " active", imbActive > 0 ? cText : cMuted, text.align_right)
     dcell(4, r, imbState, cMuted, text.align_right)
     r += 1
-
     dcell(0, r, "STRUCTURE", cMuted, text.align_left)
     dcell(1, r, structDir == 0 ? "-" : structState, structDir == 0 ? cMuted : structDir > 0 ? cBull : cBear, text.align_left)
     dcell(2, r, "RANGE", cMuted, text.align_right)
     dcell(3, r, na(eqLvl) ? "-" : fmt(drLo, format.mintick) + "-" + fmt(drHi, format.mintick), cText, text.align_right)
     dcell(4, r, pdState, pdState == "Premium" ? cWarn : pdState == "Discount" ? cAccent : cMuted, text.align_right)
     r += 1
-
     dcell(0, r, "VWAP", cMuted, text.align_left)
     dcell(1, r, vwapValid ? primaryName + " " + str.tostring(vwapVal, format.mintick) : "-",
          vwapValid ? cText : cMuted, text.align_left)
@@ -3037,14 +3056,18 @@ renderDashboard() =>
     dcell(3, r, fmt(vwapSd, format.mintick), cText, text.align_right)
     dcell(4, r, vwapZone, cMuted, text.align_right)
     r += 1
-
     dcell(0, r, "VALUE", cMuted, text.align_left)
     dcell(1, r, valueState, na(valuePos) ? cMuted : valuePos > 0 ? cBull : valuePos < 0 ? cBear : cText, text.align_left)
     dcell(2, r, "DEV POC", cMuted, text.align_right)
     dcell(3, r, fmt(devPoc, format.mintick), cText, text.align_right)
     dcell(4, r, curProf.ready ? str.tostring(curProf.bins) + " bins" : "warming up", cMuted, text.align_right)
     r += 1
+    r
 
+//@function Dashboard rows, part 4 of 4. Split for the same reason as
+//          the debug blocks: the 254 external-element limit is per function.
+dashDataQuality(int r0) =>
+    int r = r0
     // ---- data quality (never optional: the user must always know the source)
     dcell(0, r, "PROFILE DATA", cMuted, text.align_left)
     dcell(1, r, resolvedSource, resolvedSource == "FOOTPRINT" ? cWarn : cText, text.align_left)
@@ -3052,7 +3075,6 @@ renderDashboard() =>
     dcell(3, r, volumeValid ? "OK" : "MISSING", volumeValid ? cBull : cWarn, text.align_right)
     dcell(4, r, resolvedDeltaSource, cMuted, text.align_right)
     r += 1
-
     if histoBudgetHit
         dcell(0, r, "NOTE", cWarn, text.align_left)
         dcell(1, r, "Histogram hidden: bins exceed the box budget (" + str.tostring(curBoxBudget) + ")", cWarn, text.align_left)
@@ -3060,7 +3082,6 @@ renderDashboard() =>
         dcell(3, r, "", cWarn, text.align_right)
         dcell(4, r, "", cWarn, text.align_right)
         r += 1
-
     if curProf.clamped
         dcell(0, r, "WARNING", cWarn, text.align_left)
         dcell(1, r, "Profile grid clamped - tails may be mis-binned", cWarn, text.align_left)
@@ -3068,7 +3089,6 @@ renderDashboard() =>
         dcell(3, r, "", cWarn, text.align_right)
         dcell(4, r, "", cWarn, text.align_right)
         r += 1
-
     dcell(0, r, "INTEGRITY", cMuted, text.align_left)
     dcell(1, r, confirmClose ? "Confirmed on bar close" : "Intrabar (live updates)",
          confirmClose ? cBull : cWarn, text.align_left)
@@ -3076,7 +3096,16 @@ renderDashboard() =>
     dcell(3, r, ACE_VERSION + " " + ACE_BUILD, cMuted, text.align_right)
     dcell(4, r, ACE_PHASE, cMuted, text.align_right)
     r += 1
+    r
 
+renderDashboard() =>
+    table.clear(dash, 0, 0, 4, 35)
+    int r = 0
+    r := dashHeader(r)
+    r := dashSummary(r)
+    r := dashLevels(r)
+    r := dashLevels2(r)
+    r := dashDataQuality(r)
 // ============================================================================
 //  14. DEBUG FRAMEWORK
 // ============================================================================
@@ -3094,6 +3123,194 @@ dbgEngineRow(int row, EngineState e) =>
          text_size = size.tiny, text_halign = text.align_left)
     table.cell(dbg, 2, row, e.phase + " · " + e.summary, text_color = cMuted, text_size = size.tiny, text_halign = text.align_left)
 
+//@function Debug rows, part 1 of 5. The split exists only to stay
+//          under the 254 external-element limit Pine applies PER FUNCTION.
+//          Every original row is preserved, in the original order.
+dbgBlock1(int r0) =>
+    int r = r0
+    dbgRow(r, "bar_index", str.tostring(bar_index), cText)
+    r += 1
+    dbgRow(r, "mintick", str.tostring(syminfo.mintick), cText)
+    r += 1
+    dbgRow(r, "tf seconds", str.tostring(timeframe.in_seconds()), cText)
+    r += 1
+    dbgRow(r, "volume valid", volumeValid ? "true" : "false", volumeValid ? cBull : cWarn)
+    r += 1
+    dbgRow(r, "bar confirmed", barConfirmed ? "true" : "false", barConfirmed ? cBull : cWarn)
+    r += 1
+    dbgRow(r, "profile source", resolvedSource, cText)
+    r += 1
+    dbgRow(r, "rvol", fmt(rvol, "0.00"), cText)
+    r += 1
+    dbgRow(r, "perf mode", str.tostring(perfMode), cText)
+    r += 1
+    dbgRow(r, "bins / profiles", str.tostring(resolvedBins) + " / " + str.tostring(resolvedProfiles), cText)
+    r += 1
+    dbgRow(r, "max zones", str.tostring(resolvedMaxZones), cText)
+    r += 1
+    dbgRow(r, "recalc / lines", "every " + str.tostring(profRecalcEvery) + "b / " + (devEnabled ? "on" : "off"), cText)
+    r += 1
+    dbgRow(r, "profile ready", curProf.ready ? "yes" : "no", curProf.ready ? cBull : cWarn)
+    r += 1
+    dbgRow(r, "bias / conf", fmtSigned(score.bias) + " / " + str.tostring(score.confidence, "0.00"), cText)
+    r += 1
+    dbgRow(r, "cov/agr/str", str.tostring(score.coverage, "0.00") + " / " + str.tostring(score.agreement, "0.00") + " / " + str.tostring(score.strength, "0.00"), cText)
+    r += 1
+    dbgRow(r, "top mover", chgIdx1 < 0 ? "-" : array.get(components, chgIdx1).name + " " + fmtSigned(chgVal1), math.abs(chgVal1) >= changeMin ? cText : cMuted)
+    r += 1
+    dbgRow(r, "validity change", validChgIdx < 0 ? "none" : array.get(components, validChgIdx).name + (validChgDir > 0 ? " +" : " -"), validChgIdx < 0 ? cMuted : cWarn)
+    r += 1
+    r
+
+//@function Debug rows, part 2 of 5. The split exists only to stay
+//          under the 254 external-element limit Pine applies PER FUNCTION.
+//          Every original row is preserved, in the original order.
+dbgBlock2(int r0) =>
+    int r = r0
+    dbgRow(r, "bias delta", fmtSigned(biasDelta), cText)
+    r += 1
+    dbgRow(r, "components", str.tostring(score.activeCount) + " active / " + str.tostring(score.enabledCount) + " enabled", cText)
+    r += 1
+    dbgRow(r, "profile src", useTpoSrc ? "TPO" : "VOLUME", useTpoSrc ? cWarn : cText)
+    r += 1
+    dbgRow(r, "prof bins/cap", str.tostring(curProf.bins) + " / " + str.tostring(binCapHard), curProf.clamped ? cWarn : cText)
+    r += 1
+    dbgRow(r, "prof step", str.tostring(curProf.step, format.mintick), cText)
+    r += 1
+    dbgRow(r, "prof range", fmt(curProf.lo, format.mintick) + " .. " + fmt(curProf.hi, format.mintick), cText)
+    r += 1
+    dbgRow(r, "prof total", fmt(useTpoSrc ? curProf.tpoTotal : curProf.total, format.volume), cText)
+    r += 1
+    dbgRow(r, "prof bars", str.tostring(bar_index - curProf.startBar + 1), cText)
+    r += 1
+    dbgRow(r, "value pos", fmt(valuePos, "0.000"), cText)
+    r += 1
+    dbgRow(r, "vwap primary", primaryName + " " + fmt(vwapVal, format.mintick), vwapValid ? cText : cWarn)
+    r += 1
+    dbgRow(r, "vwap sigma", fmt(vwapSd, format.mintick), cText)
+    r += 1
+    dbgRow(r, "vwap z", fmt(vwapZ, "0.000"), cText)
+    r += 1
+    dbgRow(r, "session vwap", fmt(accSession.vwap, format.mintick), cText)
+    r += 1
+    dbgRow(r, "ta.vwap ref", fmt(refVwap, format.mintick), cText)
+    r += 1
+    dbgRow(r, "diff (ticks)", fmt(vwapDiffTicks, "0.0000"),
+         na(vwapDiffTicks) ? cMuted : vwapDiffTicks < 0.5 ? cBull : cWarn)
+    r += 1
+    dbgRow(r, "anchored #1/#2", anc1Status + " / " + anc2Status, cText)
+    r += 1
+    r
+
+//@function Debug rows, part 3 of 5. The split exists only to stay
+//          under the 254 external-element limit Pine applies PER FUNCTION.
+//          Every original row is preserved, in the original order.
+dbgBlock3(int r0) =>
+    int r = r0
+    dbgRow(r, "swing len / lag", str.tostring(swingLen) + " bars confirmation delay", cWarn)
+    r += 1
+    dbgRow(r, "swings kept", str.tostring(array.size(swings)) + " / " + str.tostring(maxSwings), cText)
+    r += 1
+    dbgRow(r, "last SH / SL", fmt(lastSH, format.mintick) + " / " + fmt(lastSL, format.mintick), cText)
+    r += 1
+    dbgRow(r, "pending hi / lo", (structHiBroken ? "taken" : fmt(structHi, format.mintick)) + " / " + (structLoBroken ? "taken" : fmt(structLo, format.mintick)), cText)
+    r += 1
+    dbgRow(r, "struct dir", structDir == 0 ? "none" : structDir > 0 ? "+1 (up)" : "-1 (down)", structDir == 0 ? cMuted : cText)
+    r += 1
+    dbgRow(r, "last event", na(lastEvBar) ? "-" : evName(lastEvType) + " " + str.tostring(bar_index - lastEvBar) + "b ago", cText)
+    r += 1
+    dbgRow(r, "events kept", str.tostring(array.size(evBar)) + " / " + str.tostring(maxStructEvents), cText)
+    r += 1
+    dbgRow(r, "premium/discount", pdState + " " + fmt(pdPos, "0.000"), cText)
+    r += 1
+    dbgRow(r, "displacement", (dispBody ? "body yes" : "body no") + (dispNeedsFvg ? (fvgAnyNew ? ", FVG yes" : ", FVG no") : ", FVG gate off"), cMuted)
+    r += 1
+    dbgRow(r, "box budget", "prof " + str.tostring(curBoxBudget) + "+" + str.tostring(prvBoxBudget) + ", fvg " + str.tostring(fvgBoxBudget) + (histoBudgetHit ? " OVER" : " ok"), histoBudgetHit ? cWarn : cText)
+    r += 1
+    dbgRow(r, "zones tracked", str.tostring(array.size(zones)) + " / " + str.tostring(resolvedMaxZones) + ", active " + str.tostring(imbActive), cText)
+    r += 1
+    dbgRow(r, "fvg new", (fvgUpNew ? "bull " : "") + (fvgDnNew ? "bear" : "") + (fvgUpNew or fvgDnNew ? "" : "none"), cText)
+    r += 1
+    dbgRow(r, "fvg min size", fmt(fvgMinSize, format.mintick) + " (" + str.tostring(minFvgAtr, "0.00") + " ATR)", cText)
+    r += 1
+    dbgRow(r, "liq levels", str.tostring(array.size(liqPrice)) + " / " + str.tostring(maxLiqLevels) + ", EQH " + str.tostring(eqHighCount) + " EQL " + str.tostring(eqLowCount), cText)
+    r += 1
+    dbgRow(r, "nearest pools", fmt(nearestBelow, format.mintick) + " < px < " + fmt(nearestAbove, format.mintick), cText)
+    r += 1
+    dbgRow(r, "sweep pending", na(sweepPendBar) ? "none" : (sweepPendSide > 0 ? "BSL" : "SSL") + " " + str.tostring(bar_index - sweepPendBar) + "/" + str.tostring(sweepConfirmBars) + "b", na(sweepPendBar) ? cMuted : cWarn)
+    r += 1
+    r
+
+//@function Debug rows, part 4 of 5. The split exists only to stay
+//          under the 254 external-element limit Pine applies PER FUNCTION.
+//          Every original row is preserved, in the original order.
+dbgBlock4(int r0) =>
+    int r = r0
+    dbgRow(r, "sweep last", na(lastSweepBar) ? "none" : (lastSweepSide > 0 ? "BSL " : "SSL ") + fmt(lastSweepLevel, format.mintick) + " " + str.tostring(bar_index - lastSweepBar) + "b", cText)
+    r += 1
+    dbgRow(r, "prev day hi/lo", fmt(prevDayHi, format.mintick) + " / " + fmt(prevDayLo, format.mintick), cText)
+    r += 1
+    dbgRow(r, "order blocks", "not implemented (input is inert)", cWarn)
+    r += 1
+    dbgRow(r, "ltf resolution", ltfRes == "" ? "none available" : ltfRes + " x" + str.tostring(ltfCount), ltfCount > 0 ? cText : cMuted)
+    r += 1
+    dbgRow(r, "footprint", fpAvailable() ? "available" : "unavailable (STD build or plan/data)", fpAvailable() ? cBull : cMuted)
+    r += 1
+    dbgRow(r, "fp bar b/s/d", fmt(fpBuy, format.volume) + " / " + fmt(fpSell, format.volume) + " / " + fmt(fpDelta, format.volume), cText)
+    r += 1
+    dbgRow(r, "delta tier", deltaTier + " - " + resolvedDeltaSource, deltaTier == "BAR" ? cMuted : cWarn)
+    r += 1
+    dbgRow(r, "delta value", fmt(deltaProxy, format.volume), cText)
+    r += 1
+    dbgRow(r, "cum delta", fmt(cumDelta, format.volume) + " norm " + fmt(cumDeltaNorm, "0.000"), cText)
+    r += 1
+    dbgRow(r, "fp imbalances", "buy " + str.tostring(ofBuyImb) + " sell " + str.tostring(ofSellImb), cText)
+    r += 1
+    dbgRow(r, "fp stack", ofStackLen == 0 ? "none (min " + str.tostring(fpMinStack) + ")" : str.tostring(ofStackLen) + (ofStackDir > 0 ? " buy" : " sell"), ofStackLen > 0 ? cWarn : cMuted)
+    r += 1
+    dbgRow(r, "unfinished auction", (ofUnfTop ? "top " : "") + (ofUnfBot ? "bottom" : "") + (ofUnfTop or ofUnfBot ? "" : "none"), ofUnfTop or ofUnfBot ? cWarn : cMuted)
+    r += 1
+    dbgRow(r, "session mins", na(minsIntoSession) ? "-" : str.tostring(minsIntoSession), cText)
+    r += 1
+    dbgRow(r, "IB / OR", (ibApplicable ? fmt(ibL, format.mintick) + "-" + fmt(ibH, format.mintick) + (ibDone ? " done" : " forming") : "n/a") + " | " + (orApplicable ? fmt(orL, format.mintick) + "-" + fmt(orH, format.mintick) : "n/a"), ibApplicable ? cText : cMuted)
+    r += 1
+    dbgRow(r, "open type", openType, openType == "-" ? cMuted : cAccent)
+    r += 1
+    dbgRow(r, "balance B1/B2/B3", (balM1 ? "1" : "0") + "/" + (balM2 ? "1" : "0") + "/" + (balM3 ? "1" : "0") + " agree " + str.tostring(balAgree), cText)
+    r += 1
+    r
+
+//@function Debug rows, part 5 of 5. The split exists only to stay
+//          under the 254 external-element limit Pine applies PER FUNCTION.
+//          Every original row is preserved, in the original order.
+dbgBlock5(int r0) =>
+    int r = r0
+    dbgRow(r, "efficiency ratio", fmt(efficiency, "0.000") + (trendM3 ? " (trend)" : balM3 ? " (balance)" : ""), cText)
+    r += 1
+    dbgRow(r, "va overlap", fmt(vaOverlap, "0.000"), cText)
+    r += 1
+    dbgRow(r, "balance state", inBalance ? str.tostring(balBars) + "b " + fmt(balLo, format.mintick) + "-" + fmt(balHi, format.mintick) : "not in balance", inBalance ? cText : cMuted)
+    r += 1
+    dbgRow(r, "imbalance", imbDir == 0 ? "none" : (imbDir > 0 ? "up " : "down ") + fmt(imbLevel, format.mintick) + " " + str.tostring(bar_index - imbBar) + "b", imbDir == 0 ? cMuted : cWarn)
+    r += 1
+    dbgRow(r, "acc reference", refName + " " + fmt(refLo, format.mintick) + "-" + fmt(refHi, format.mintick), na(refHi) ? cMuted : cText)
+    r += 1
+    dbgRow(r, "acceptance", amtAcceptDir == 0 ? "none" : (amtAcceptDir > 0 ? "above " : "below ") + "mag " + fmt(amtAcceptMag, "0.00"), amtAcceptDir == 0 ? cMuted : cBull)
+    r += 1
+    dbgRow(r, "closes a/b", str.tostring(closesAbove) + " / " + str.tostring(closesBelow) + " need " + str.tostring(accCloses), cText)
+    r += 1
+    dbgRow(r, "time frac a/b", fmt(timeAboveFrac, "0.00") + " / " + fmt(timeBelowFrac, "0.00") + " need " + str.tostring(accTimePct / 100, "0.00"), cText)
+    r += 1
+    dbgRow(r, "rejection", amtRejectDir == 0 ? "none" : (amtRejectDir > 0 ? "upper " : "lower ") + str.tostring(bar_index - amtRejectBar) + "b", amtRejectDir == 0 ? cMuted : cWarn)
+    r += 1
+    dbgRow(r, "initiative b/s", fmt(initBuyNorm, "0.00") + " / " + fmt(initSellNorm, "0.00"), cText)
+    r += 1
+    dbgRow(r, "responsive b/s", fmt(respBuyNorm, "0.00") + " / " + fmt(respSellNorm, "0.00"), cText)
+    r += 1
+    dbgRow(r, "flow divergence", ofDivergeUp ? "high unconfirmed" : ofDivergeDn ? "low unconfirmed" : "none", ofDivergeUp or ofDivergeDn ? cWarn : cMuted)
+    r += 1
+    r
+
 renderDebug() =>
     table.clear(dbg, 0, 0, 2, 99)
     int r = 0
@@ -3101,162 +3318,12 @@ renderDebug() =>
     table.cell(dbg, 1, r, ACE_VERSION, text_color = cAccent, text_size = size.tiny, text_halign = text.align_left)
     table.cell(dbg, 2, r, ACE_PHASE, text_color = cMuted, text_size = size.tiny, text_halign = text.align_left)
     r += 1
-
     if dbgRuntime
-        dbgRow(r, "bar_index", str.tostring(bar_index), cText)
-        r += 1
-        dbgRow(r, "mintick", str.tostring(syminfo.mintick), cText)
-        r += 1
-        dbgRow(r, "tf seconds", str.tostring(timeframe.in_seconds()), cText)
-        r += 1
-        dbgRow(r, "volume valid", volumeValid ? "true" : "false", volumeValid ? cBull : cWarn)
-        r += 1
-        dbgRow(r, "bar confirmed", barConfirmed ? "true" : "false", barConfirmed ? cBull : cWarn)
-        r += 1
-        dbgRow(r, "profile source", resolvedSource, cText)
-        r += 1
-
-        dbgRow(r, "rvol", fmt(rvol, "0.00"), cText)
-        r += 1
-        dbgRow(r, "perf mode", str.tostring(perfMode), cText)
-        r += 1
-        dbgRow(r, "bins / profiles", str.tostring(resolvedBins) + " / " + str.tostring(resolvedProfiles), cText)
-        r += 1
-        dbgRow(r, "max zones", str.tostring(resolvedMaxZones), cText)
-        r += 1
-        dbgRow(r, "recalc / lines", "every " + str.tostring(profRecalcEvery) + "b / " + (devEnabled ? "on" : "off"), cText)
-        r += 1
-        dbgRow(r, "profile ready", curProf.ready ? "yes" : "no", curProf.ready ? cBull : cWarn)
-        r += 1
-        dbgRow(r, "bias / conf", fmtSigned(score.bias) + " / " + str.tostring(score.confidence, "0.00"), cText)
-        r += 1
-        dbgRow(r, "cov/agr/str", str.tostring(score.coverage, "0.00") + " / " + str.tostring(score.agreement, "0.00") + " / " + str.tostring(score.strength, "0.00"), cText)
-        r += 1
-        dbgRow(r, "top mover", chgIdx1 < 0 ? "-" : array.get(components, chgIdx1).name + " " + fmtSigned(chgVal1), math.abs(chgVal1) >= changeMin ? cText : cMuted)
-        r += 1
-        dbgRow(r, "validity change", validChgIdx < 0 ? "none" : array.get(components, validChgIdx).name + (validChgDir > 0 ? " +" : " -"), validChgIdx < 0 ? cMuted : cWarn)
-        r += 1
-        dbgRow(r, "bias delta", fmtSigned(biasDelta), cText)
-        r += 1
-        dbgRow(r, "components", str.tostring(score.activeCount) + " active / " + str.tostring(score.enabledCount) + " enabled", cText)
-        r += 1
-        dbgRow(r, "profile src", useTpoSrc ? "TPO" : "VOLUME", useTpoSrc ? cWarn : cText)
-        r += 1
-        dbgRow(r, "prof bins/cap", str.tostring(curProf.bins) + " / " + str.tostring(binCapHard), curProf.clamped ? cWarn : cText)
-        r += 1
-        dbgRow(r, "prof step", str.tostring(curProf.step, format.mintick), cText)
-        r += 1
-        dbgRow(r, "prof range", fmt(curProf.lo, format.mintick) + " .. " + fmt(curProf.hi, format.mintick), cText)
-        r += 1
-        dbgRow(r, "prof total", fmt(useTpoSrc ? curProf.tpoTotal : curProf.total, format.volume), cText)
-        r += 1
-        dbgRow(r, "prof bars", str.tostring(bar_index - curProf.startBar + 1), cText)
-        r += 1
-        dbgRow(r, "value pos", fmt(valuePos, "0.000"), cText)
-        r += 1
-        dbgRow(r, "vwap primary", primaryName + " " + fmt(vwapVal, format.mintick), vwapValid ? cText : cWarn)
-        r += 1
-        dbgRow(r, "vwap sigma", fmt(vwapSd, format.mintick), cText)
-        r += 1
-        dbgRow(r, "vwap z", fmt(vwapZ, "0.000"), cText)
-        r += 1
-        dbgRow(r, "session vwap", fmt(accSession.vwap, format.mintick), cText)
-        r += 1
-        dbgRow(r, "ta.vwap ref", fmt(refVwap, format.mintick), cText)
-        r += 1
-        dbgRow(r, "diff (ticks)", fmt(vwapDiffTicks, "0.0000"),
-             na(vwapDiffTicks) ? cMuted : vwapDiffTicks < 0.5 ? cBull : cWarn)
-        r += 1
-        dbgRow(r, "anchored #1/#2", anc1Status + " / " + anc2Status, cText)
-        r += 1
-        dbgRow(r, "swing len / lag", str.tostring(swingLen) + " bars confirmation delay", cWarn)
-        r += 1
-        dbgRow(r, "swings kept", str.tostring(array.size(swings)) + " / " + str.tostring(maxSwings), cText)
-        r += 1
-        dbgRow(r, "last SH / SL", fmt(lastSH, format.mintick) + " / " + fmt(lastSL, format.mintick), cText)
-        r += 1
-        dbgRow(r, "pending hi / lo", (structHiBroken ? "taken" : fmt(structHi, format.mintick)) + " / " + (structLoBroken ? "taken" : fmt(structLo, format.mintick)), cText)
-        r += 1
-        dbgRow(r, "struct dir", structDir == 0 ? "none" : structDir > 0 ? "+1 (up)" : "-1 (down)", structDir == 0 ? cMuted : cText)
-        r += 1
-        dbgRow(r, "last event", na(lastEvBar) ? "-" : evName(lastEvType) + " " + str.tostring(bar_index - lastEvBar) + "b ago", cText)
-        r += 1
-        dbgRow(r, "events kept", str.tostring(array.size(evBar)) + " / " + str.tostring(maxStructEvents), cText)
-        r += 1
-        dbgRow(r, "premium/discount", pdState + " " + fmt(pdPos, "0.000"), cText)
-        r += 1
-        dbgRow(r, "displacement", (dispBody ? "body yes" : "body no") + (dispNeedsFvg ? (fvgAnyNew ? ", FVG yes" : ", FVG no") : ", FVG gate off"), cMuted)
-        r += 1
-        dbgRow(r, "box budget", "prof " + str.tostring(curBoxBudget) + "+" + str.tostring(prvBoxBudget) + ", fvg " + str.tostring(fvgBoxBudget) + (histoBudgetHit ? " OVER" : " ok"), histoBudgetHit ? cWarn : cText)
-        r += 1
-        dbgRow(r, "zones tracked", str.tostring(array.size(zones)) + " / " + str.tostring(resolvedMaxZones) + ", active " + str.tostring(imbActive), cText)
-        r += 1
-        dbgRow(r, "fvg new", (fvgUpNew ? "bull " : "") + (fvgDnNew ? "bear" : "") + (fvgUpNew or fvgDnNew ? "" : "none"), cText)
-        r += 1
-        dbgRow(r, "fvg min size", fmt(fvgMinSize, format.mintick) + " (" + str.tostring(minFvgAtr, "0.00") + " ATR)", cText)
-        r += 1
-        dbgRow(r, "liq levels", str.tostring(array.size(liqPrice)) + " / " + str.tostring(maxLiqLevels) + ", EQH " + str.tostring(eqHighCount) + " EQL " + str.tostring(eqLowCount), cText)
-        r += 1
-        dbgRow(r, "nearest pools", fmt(nearestBelow, format.mintick) + " < px < " + fmt(nearestAbove, format.mintick), cText)
-        r += 1
-        dbgRow(r, "sweep pending", na(sweepPendBar) ? "none" : (sweepPendSide > 0 ? "BSL" : "SSL") + " " + str.tostring(bar_index - sweepPendBar) + "/" + str.tostring(sweepConfirmBars) + "b", na(sweepPendBar) ? cMuted : cWarn)
-        r += 1
-        dbgRow(r, "sweep last", na(lastSweepBar) ? "none" : (lastSweepSide > 0 ? "BSL " : "SSL ") + fmt(lastSweepLevel, format.mintick) + " " + str.tostring(bar_index - lastSweepBar) + "b", cText)
-        r += 1
-        dbgRow(r, "prev day hi/lo", fmt(prevDayHi, format.mintick) + " / " + fmt(prevDayLo, format.mintick), cText)
-        r += 1
-        dbgRow(r, "order blocks", "not implemented (input is inert)", cWarn)
-        r += 1
-        dbgRow(r, "ltf resolution", ltfRes == "" ? "none available" : ltfRes + " x" + str.tostring(ltfCount), ltfCount > 0 ? cText : cMuted)
-        r += 1
-        dbgRow(r, "footprint", fpAvailable() ? "available" : "unavailable (STD build or plan/data)", fpAvailable() ? cBull : cMuted)
-        r += 1
-        dbgRow(r, "fp bar b/s/d", fmt(fpBuy, format.volume) + " / " + fmt(fpSell, format.volume) + " / " + fmt(fpDelta, format.volume), cText)
-        r += 1
-        dbgRow(r, "delta tier", deltaTier + " - " + resolvedDeltaSource, deltaTier == "BAR" ? cMuted : cWarn)
-        r += 1
-        dbgRow(r, "delta value", fmt(deltaProxy, format.volume), cText)
-        r += 1
-        dbgRow(r, "cum delta", fmt(cumDelta, format.volume) + " norm " + fmt(cumDeltaNorm, "0.000"), cText)
-        r += 1
-        dbgRow(r, "fp imbalances", "buy " + str.tostring(ofBuyImb) + " sell " + str.tostring(ofSellImb), cText)
-        r += 1
-        dbgRow(r, "fp stack", ofStackLen == 0 ? "none (min " + str.tostring(fpMinStack) + ")" : str.tostring(ofStackLen) + (ofStackDir > 0 ? " buy" : " sell"), ofStackLen > 0 ? cWarn : cMuted)
-        r += 1
-        dbgRow(r, "unfinished auction", (ofUnfTop ? "top " : "") + (ofUnfBot ? "bottom" : "") + (ofUnfTop or ofUnfBot ? "" : "none"), ofUnfTop or ofUnfBot ? cWarn : cMuted)
-        r += 1
-        dbgRow(r, "session mins", na(minsIntoSession) ? "-" : str.tostring(minsIntoSession), cText)
-        r += 1
-        dbgRow(r, "IB / OR", (ibApplicable ? fmt(ibL, format.mintick) + "-" + fmt(ibH, format.mintick) + (ibDone ? " done" : " forming") : "n/a") + " | " + (orApplicable ? fmt(orL, format.mintick) + "-" + fmt(orH, format.mintick) : "n/a"), ibApplicable ? cText : cMuted)
-        r += 1
-        dbgRow(r, "open type", openType, openType == "-" ? cMuted : cAccent)
-        r += 1
-        dbgRow(r, "balance B1/B2/B3", (balM1 ? "1" : "0") + "/" + (balM2 ? "1" : "0") + "/" + (balM3 ? "1" : "0") + " agree " + str.tostring(balAgree), cText)
-        r += 1
-        dbgRow(r, "efficiency ratio", fmt(efficiency, "0.000") + (trendM3 ? " (trend)" : balM3 ? " (balance)" : ""), cText)
-        r += 1
-        dbgRow(r, "va overlap", fmt(vaOverlap, "0.000"), cText)
-        r += 1
-        dbgRow(r, "balance state", inBalance ? str.tostring(balBars) + "b " + fmt(balLo, format.mintick) + "-" + fmt(balHi, format.mintick) : "not in balance", inBalance ? cText : cMuted)
-        r += 1
-        dbgRow(r, "imbalance", imbDir == 0 ? "none" : (imbDir > 0 ? "up " : "down ") + fmt(imbLevel, format.mintick) + " " + str.tostring(bar_index - imbBar) + "b", imbDir == 0 ? cMuted : cWarn)
-        r += 1
-        dbgRow(r, "acc reference", refName + " " + fmt(refLo, format.mintick) + "-" + fmt(refHi, format.mintick), na(refHi) ? cMuted : cText)
-        r += 1
-        dbgRow(r, "acceptance", amtAcceptDir == 0 ? "none" : (amtAcceptDir > 0 ? "above " : "below ") + "mag " + fmt(amtAcceptMag, "0.00"), amtAcceptDir == 0 ? cMuted : cBull)
-        r += 1
-        dbgRow(r, "closes a/b", str.tostring(closesAbove) + " / " + str.tostring(closesBelow) + " need " + str.tostring(accCloses), cText)
-        r += 1
-        dbgRow(r, "time frac a/b", fmt(timeAboveFrac, "0.00") + " / " + fmt(timeBelowFrac, "0.00") + " need " + str.tostring(accTimePct / 100, "0.00"), cText)
-        r += 1
-        dbgRow(r, "rejection", amtRejectDir == 0 ? "none" : (amtRejectDir > 0 ? "upper " : "lower ") + str.tostring(bar_index - amtRejectBar) + "b", amtRejectDir == 0 ? cMuted : cWarn)
-        r += 1
-        dbgRow(r, "initiative b/s", fmt(initBuyNorm, "0.00") + " / " + fmt(initSellNorm, "0.00"), cText)
-        r += 1
-        dbgRow(r, "responsive b/s", fmt(respBuyNorm, "0.00") + " / " + fmt(respSellNorm, "0.00"), cText)
-        r += 1
-        dbgRow(r, "flow divergence", ofDivergeUp ? "high unconfirmed" : ofDivergeDn ? "low unconfirmed" : "none", ofDivergeUp or ofDivergeDn ? cWarn : cMuted)
-        r += 1
+        r := dbgBlock1(r)
+        r := dbgBlock2(r)
+        r := dbgBlock3(r)
+        r := dbgBlock4(r)
+        r := dbgBlock5(r)
 
     if dbgEngines
         dbgEngineRow(r, engProfile)
@@ -3273,7 +3340,6 @@ renderDebug() =>
         r += 1
         dbgEngineRow(r, engVol)
         r += 1
-
 // ============================================================================
 //  14b. PROFILE RENDER                                                    [P1]
 //  Objects are pooled and updated in place - never recreated per bar - so the
@@ -3718,15 +3784,27 @@ bool alAcceptDn = amtAcceptDir == -1 and nz(amtAcceptDir[1], 0) != -1
 bool alRejectUp = rejectUp
 bool alRejectDn = rejectDn
 
-bool alVwapUp = vwapValid and barConfirmed and ta.crossover(close, vwapVal)
-bool alVwapDn = vwapValid and barConfirmed and ta.crossunder(close, vwapVal)
-bool alBand3U = vwapValid and showVwapBands and barConfirmed and ta.crossover(close, bandU3)
-bool alBand3D = vwapValid and showVwapBands and barConfirmed and ta.crossunder(close, bandL3)
+// Crossings are computed FIRST, unconditionally. Behind `and` they were
+// subject to short-circuit evaluation: on a bar where the left-hand side was
+// false the crossing never ran, and a transition could be missed outright.
+bool xVwapUp = ta.crossover(close, vwapVal)
+bool xVwapDn = ta.crossunder(close, vwapVal)
+bool xBand3U = ta.crossover(close, bandU3)
+bool xBand3D = ta.crossunder(close, bandL3)
+bool xVahUp  = ta.crossover(close, curProf.vah)
+bool xValDn  = ta.crossunder(close, curProf.val)
+bool xPocUp  = ta.crossover(close, curProf.poc)
+bool xPocDn  = ta.crossunder(close, curProf.poc)
 
-bool alVahUp = curProf.ready and barConfirmed and ta.crossover(close, curProf.vah)
-bool alValDn = curProf.ready and barConfirmed and ta.crossunder(close, curProf.val)
-bool alPocUp = curProf.ready and barConfirmed and ta.crossover(close, curProf.poc)
-bool alPocDn = curProf.ready and barConfirmed and ta.crossunder(close, curProf.poc)
+bool alVwapUp = vwapValid and barConfirmed and xVwapUp
+bool alVwapDn = vwapValid and barConfirmed and xVwapDn
+bool alBand3U = vwapValid and showVwapBands and barConfirmed and xBand3U
+bool alBand3D = vwapValid and showVwapBands and barConfirmed and xBand3D
+
+bool alVahUp = curProf.ready and barConfirmed and xVahUp
+bool alValDn = curProf.ready and barConfirmed and xValDn
+bool alPocUp = curProf.ready and barConfirmed and xPocUp
+bool alPocDn = curProf.ready and barConfirmed and xPocDn
 
 // Footprint-only facts. In the Standard build these stay false for the life of
 // the script, so the alert list is identical in both builds and simply never
