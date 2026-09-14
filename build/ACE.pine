@@ -62,8 +62,8 @@ indicator(
 // ============================================================================
 const string ACE_NAME    = "Auction Context Engine"
 const string ACE_SHORT   = "ACE"
-const string ACE_VERSION = "0.3.0-P3"
-const string ACE_PHASE   = "P3 - vwap engine"
+const string ACE_VERSION = "0.4.0-P5"
+const string ACE_PHASE   = "P5 - structure engine"
 const string ACE_BUILD   = "STD"   // rewritten to "STD" by tools/build.py
 
 // ============================================================================
@@ -144,9 +144,9 @@ enum AnchorMode
     yearOpen      = "Year open"
     highestHigh   = "Highest high in lookback"
     lowestLow     = "Lowest low in lookback"
-    lastSwingHigh = "Last swing high (needs P5)"
-    lastSwingLow  = "Last swing low (needs P5)"
-    lastBos       = "Last BOS (needs P5)"
+    lastSwingHigh = "Last swing high"
+    lastSwingLow  = "Last swing low"
+    lastBos       = "Last structure break"
 
 //@enum How the VWAP bands are sized.
 enum BandMode
@@ -378,6 +378,10 @@ float zSaturation = input.float(2.0, "Z-score saturation for scoring", minval = 
      tooltip = "The VWAP score reaches its maximum at this many sigma. " +
                "Higher = the component saturates more slowly.")
 
+int avwapMaxBars = input.int(1000, "Anchored VWAP max rebuild bars", minval = 50, maxval = 4000, group = G_VWAP,
+     tooltip = "Re-anchoring rebuilds the accumulator with a loop. Anchors further " +
+               "back than this are truncated, and the dashboard says so rather than " +
+               "quietly reporting a VWAP from a different anchor than you asked for.")
 bool useAnchored1 = input.bool(false, "Anchored VWAP #1", group = G_VWAP, inline = "a1")
 AnchorMode anc1Mode = input.enum(AnchorMode.dateTime, "", group = G_VWAP, inline = "a1")
 int anc1Time = input.time(timestamp("01 Jan 2024 00:00 +0000"), "Anchor #1 date", group = G_VWAP)
@@ -401,6 +405,9 @@ bool showChoch = input.bool(true, "CHoCH", group = G_MS, inline = "ms")
 bool showMss = input.bool(true, "MSS", group = G_MS, inline = "ms")
 bool showSwingTags = input.bool(true, "Show HH / HL / LH / LL", group = G_MS)
 bool showPremiumDiscount = input.bool(true, "Show Premium / Discount / EQ", group = G_MS)
+bool showStructLevels = input.bool(true, "Show pending structure levels", group = G_MS)
+int maxSwings = input.int(30, "Max swings kept", minval = 4, maxval = 100, group = G_MS)
+int maxStructEvents = input.int(20, "Max structure events kept", minval = 2, maxval = 100, group = G_MS)
 bool showConfirmDelay = input.bool(false, "Mark actual detection bar", group = G_MS,
      tooltip = "Draws a marker on the bar where the event was actually detectable, " +
                "not only where it is drawn. Turn this on to see the real latency.")
@@ -671,6 +678,206 @@ var EngineState engStruct  = EngineState.new("Structure", false, "P5", "not impl
 var EngineState engLiq     = EngineState.new("Liquidity", false, "P6", "not implemented")
 var EngineState engImb     = EngineState.new("Imbalance", false, "P6", "not implemented")
 var EngineState engVol     = EngineState.new("Volume",    false, "P7", "not implemented")
+
+// ============================================================================
+//  10a. STRUCTURE ENGINE                                                  [P5]
+// ----------------------------------------------------------------------------
+//  PIVOT LAG - the single most important honesty point in this engine
+//
+//  A swing is confirmed by `ta.pivothigh(high, n, n)` only after n MORE bars
+//  have closed. The swing is then recorded at bar_index - n, which is where it
+//  actually occurred.
+//
+//  This is NOT repainting: once confirmed, a swing never moves, and no closed
+//  bar is ever rewritten. But it IS a confirmation delay of exactly n bars, and
+//  it is the reason pivot-based scripts look better on a screenshot than they
+//  behave live: on history the swing appears to have been known immediately,
+//  when in reality nobody could have known it for another n bars.
+//
+//  Everything downstream inherits that delay - HH/HL/LH/LL, the levels, and
+//  therefore BOS, CHoCH and MSS. The `Mark actual detection bar` input draws a
+//  marker on the bar where each swing actually became knowable, so the real
+//  latency is visible instead of implied.
+//
+//  FACT ONLY: this engine reports swing prices, their sequence labels, which
+//  level broke and in which direction. It assigns no bullish or bearish
+//  meaning to any of that - `structDir` is simply the direction of the most
+//  recent break. The Context Engine decides what, if anything, it implies.
+// ============================================================================
+
+// Event type codes. Kept as ints because they live in arrays.
+const int EV_BOS   = 1
+const int EV_CHOCH = 2
+const int EV_MSS   = 3
+
+var float lastSH    = na
+var int   lastSHBar = na
+var float prevSH    = na
+var float lastSL    = na
+var int   lastSLBar = na
+var float prevSL    = na
+
+// The pending level in each direction, and whether it has already been taken.
+var float structHi       = na
+var int   structHiBar    = na
+var bool  structHiBroken = false
+var float structLo       = na
+var int   structLoBar    = na
+var bool  structLoBroken = false
+
+//@variable Direction of the most recent structure break: +1, -1, or 0 if none.
+//          A measurement, not a verdict.
+var int structDir = 0
+
+var int   lastEvBar   = na
+var int   lastEvType  = 0
+var int   lastEvDir   = 0
+var float lastEvLevel = na
+
+// Bounded event history, newest last.
+var array<int>   evBar     = array.new<int>()
+var array<float> evLevel   = array.new<float>()
+var array<int>   evType    = array.new<int>()
+var array<int>   evDir     = array.new<int>()
+var array<int>   evFromBar = array.new<int>()
+
+//@function Appends a swing, keeping the list bounded.
+pushSwing(float price, int bar, bool isHigh, string tag, int cap) =>
+    array.push(swings, Swing.new(price, bar, isHigh, tag))
+    while array.size(swings) > cap
+        array.shift(swings)
+
+//@function Appends a structure break to the bounded history.
+//          Pine functions cannot assign to global variables, so this only
+//          maintains the arrays; the lastEv* scalars are set by the caller.
+pushEvent(int bar, float level, int etype, int dir, int fromBar, int cap) =>
+    array.push(evBar, bar)
+    array.push(evLevel, level)
+    array.push(evType, etype)
+    array.push(evDir, dir)
+    array.push(evFromBar, fromBar)
+    while array.size(evBar) > cap
+        array.shift(evBar)
+        array.shift(evLevel)
+        array.shift(evType)
+        array.shift(evDir)
+        array.shift(evFromBar)
+
+//@function Short name of an event code.
+evName(int etype) =>
+    etype == EV_MSS ? "MSS" : etype == EV_CHOCH ? "CHoCH" : "BOS"
+
+// ---- swing detection -------------------------------------------------------
+// ta.pivothigh/low look only backwards from the current bar. No future data is
+// involved; the cost is the n-bar confirmation delay described above.
+
+float phRaw = ta.pivothigh(high, swingLen, swingLen)
+float plRaw = ta.pivotlow(low, swingLen, swingLen)
+
+if not na(phRaw)
+    prevSH    := lastSH
+    lastSH    := phRaw
+    lastSHBar := bar_index - swingLen
+    string tag = na(prevSH) ? "H" : phRaw > prevSH ? "HH" : "LH"
+    pushSwing(phRaw, lastSHBar, true, tag, maxSwings)
+    // The most recent swing high becomes the level to be taken out.
+    structHi       := phRaw
+    structHiBar    := lastSHBar
+    structHiBroken := false
+
+if not na(plRaw)
+    prevSL    := lastSL
+    lastSL    := plRaw
+    lastSLBar := bar_index - swingLen
+    string tag = na(prevSL) ? "L" : plRaw < prevSL ? "LL" : "HL"
+    pushSwing(plRaw, lastSLBar, false, tag, maxSwings)
+    structLo       := plRaw
+    structLoBar    := lastSLBar
+    structLoBroken := false
+
+// ---- break detection -------------------------------------------------------
+
+//@variable Gate that keeps events off unconfirmed bars when the user asked for
+//          close confirmation. On historical bars this is always true.
+bool structBarOk = confirmClose ? barstate.isconfirmed : true
+
+//@variable Displacement on the breaking bar, used to separate MSS from CHoCH.
+//          P5 uses the body-vs-ATR test only; the optional "must create an FVG"
+//          condition becomes active in P6, when FVGs exist.
+bool dispNow = not na(atr) and atr > 0 and math.abs(close - open) >= dispBodyAtr * atr
+
+float brkU = breakMode == BreakMode.closeBreak ? close : high
+float brkD = breakMode == BreakMode.closeBreak ? close : low
+
+bool upTaken = structBarOk and not na(structHi) and not structHiBroken and brkU > structHi
+bool dnTaken = structBarOk and not na(structLo) and not structLoBroken and brkD < structLo
+
+// A single bar must not leave two contradictory structure states behind. When
+// one bar takes both sides (possible in Wick mode on a wide bar), the bar's own
+// direction decides which break is recorded; the other level stays pending.
+int takeDir = 0
+if upTaken and dnTaken
+    takeDir := close >= open ? 1 : -1
+else if upTaken
+    takeDir := 1
+else if dnTaken
+    takeDir := -1
+
+if takeDir != 0
+    // Continuation of the existing direction is a BOS; a break against it is a
+    // CHoCH; a CHoCH carried by a displacement bar is an MSS.
+    float lvl = takeDir > 0 ? structHi : structLo
+    int   fb  = takeDir > 0 ? structHiBar : structLoBar
+    int   et  = structDir == -takeDir ? (dispNow ? EV_MSS : EV_CHOCH) : EV_BOS
+    pushEvent(bar_index, lvl, et, takeDir, fb, maxStructEvents)
+    lastEvBar   := bar_index
+    lastEvType  := et
+    lastEvDir   := takeDir
+    lastEvLevel := lvl
+    structDir   := takeDir
+    if takeDir > 0
+        structHiBroken := true
+    else
+        structLoBroken := true
+
+// ---- dealing range / premium-discount --------------------------------------
+
+float drHi = lastSH
+float drLo = lastSL
+float eqLvl = not na(drHi) and not na(drLo) and drHi > drLo ? (drHi + drLo) / 2.0 : na
+//@variable Position of price inside the dealing range: 0 at the low, 1 at the
+//          high, 0.5 at equilibrium. Premium/discount is just a name for which
+//          half it sits in.
+float pdPos = not na(eqLvl) ? (close - drLo) / (drHi - drLo) : na
+string pdState = na(pdPos) ? "-" : pdPos > 0.5 ? "Premium" : pdPos < 0.5 ? "Discount" : "Equilibrium"
+
+// ---- FACT summary ----------------------------------------------------------
+
+float structRaw = na
+string structState = "-"
+string structReason = ""
+
+if structDir != 0
+    float evBoost = 0.0
+    if not na(lastEvBar)
+        float d = decayFactor(bar_index - lastEvBar, decayHalfLife)
+        float w = lastEvType == EV_MSS ? 0.40 : lastEvType == EV_CHOCH ? 0.35 : 0.30
+        evBoost := w * d
+    structRaw := structDir * math.min(1.0, 0.6 + evBoost)
+    structState := (structDir > 0 ? "Up" : "Down") + ", " + evName(lastEvType) + " " +
+         str.tostring(bar_index - lastEvBar) + "b"
+    structReason := "last break " + evName(lastEvType) + " of " +
+         str.tostring(lastEvLevel, format.mintick) + ", " + pdState
+else if na(lastSH) or na(lastSL)
+    structReason := "waiting for first confirmed swings (" + str.tostring(swingLen) + " bar lag)"
+else
+    structReason := "swings confirmed, no structure break yet"
+
+engStruct.ready := structDir != 0
+if structDir != 0
+    engStruct.summary := structState + ", swings " + str.tostring(array.size(swings))
+else
+    engStruct.summary := structReason
 
 // ============================================================================
 //  10b. PROFILE ENGINE                                                    [P1]
@@ -1059,6 +1266,7 @@ type VwapAcc
     float vwap     = na
     float sd       = na
     int   anchorBar = na
+    int   srcAnchor = na      // requested anchor bar, before any truncation
     bool  active   = false
     bool  valid    = false
 
@@ -1182,19 +1390,42 @@ vwapApplyAnchor(VwapAcc a, AnchorMode mode, int anchorTime, int lookback) =>
         vwapAdd(a, vwapSrc, volume)
     else if mode == AnchorMode.highestHigh
         int back = int(math.abs(nz(ta.highestbars(high, lookback), 0)))
-        if na(a.anchorBar) or bar_index - back != a.anchorBar
+        int ab = bar_index - back
+        if na(a.srcAnchor) or a.srcAnchor != ab
+            a.srcAnchor := ab
             vwapRebuild(a, back)
         else
             vwapAdd(a, vwapSrc, volume)
     else if mode == AnchorMode.lowestLow
         int back = int(math.abs(nz(ta.lowestbars(low, lookback), 0)))
-        if na(a.anchorBar) or bar_index - back != a.anchorBar
+        int ab = bar_index - back
+        if na(a.srcAnchor) or a.srcAnchor != ab
+            a.srcAnchor := ab
             vwapRebuild(a, back)
         else
             vwapAdd(a, vwapSrc, volume)
     else
-        // Structure-based anchors are honest about not existing yet.
-        status := "needs Structure Engine (P5)"
+        // Structure-based anchors, live as of P5.
+        int ab = mode == AnchorMode.lastSwingHigh ? lastSHBar :
+             mode == AnchorMode.lastSwingLow ? lastSLBar : lastEvBar
+        if na(ab)
+            status := mode == AnchorMode.lastBos ? "no structure break yet" : "no confirmed swing yet"
+        else
+            int rawBack = bar_index - ab
+            // A rebuild is a loop over `back` bars. Anchors far in the past are
+            // truncated rather than risking a loop timeout, and the truncation
+            // is reported instead of silently changing the value.
+            int back = math.min(rawBack, avwapMaxBars)
+            if back < rawBack
+                status := "anchor truncated to " + str.tostring(avwapMaxBars) + " bars"
+            // Keyed on the REQUESTED anchor, not on the truncated one: a
+            // truncated anchor moves every bar, and rebuilding on every bar
+            // would run the rebuild loop continuously.
+            if na(a.srcAnchor) or a.srcAnchor != ab
+                a.srcAnchor := ab
+                vwapRebuild(a, back)
+            else
+                vwapAdd(a, vwapSrc, volume)
     status
 
 string anc1Status = useAnchored1 ? vwapApplyAnchor(accAnc1, anc1Mode, anc1Time, anc1Lookback) : "off"
@@ -1306,8 +1537,9 @@ string primaryStatus = switch primaryVwap
     => volumeValid ? "warming up" : "no volume data"
 
 // FACT values gated by Confirm-on-bar-close before they reach the score.
-float valuePosHeld = hold(valuePos)
-float vwapZHeld    = hold(vwapZ)
+float valuePosHeld  = hold(valuePos)
+float vwapZHeld     = hold(vwapZ)
+float structRawHeld = hold(structRaw)
 
 buildComponents() =>
     array<Component> c = array.new<Component>()
@@ -1329,8 +1561,19 @@ buildComponents() =>
         vp.reason := curProf.bins > 0 ? "profile warming up" : "no profile"
     c.push(vp)
 
-    c.push(Component.new(name = "Structure", weight = wStruct, enabled = enStruct,
-         state = "-", reason = "engine arrives in P5"))
+    // --- Market Structure: live as of P5 ---
+    Component st = Component.new(name = "Structure", weight = wStruct, enabled = enStruct)
+    if not na(structRawHeld)
+        st.valid  := true
+        st.raw    := clamp(structRawHeld, -1.0, 1.0)
+        st.state  := structState
+        st.reason := structReason
+    else
+        st.state  := "-"
+        // NO DATA != NEUTRAL: no confirmed break is not a balanced market,
+        // it is an absence of evidence, and the reason says which kind.
+        st.reason := structReason
+    c.push(st)
 
     // --- VWAP: live as of P3 ---
     Component vw = Component.new(name = "VWAP", weight = wVwap, enabled = enVwap)
@@ -1422,7 +1665,7 @@ var array<float> prevContrib = array.new<float>(7, 0.0)
 //  13. DASHBOARD
 // ============================================================================
 
-var table dash = table.new(dashPosStr, 5, 26, bgcolor = cPanel,
+var table dash = table.new(dashPosStr, 5, 28, bgcolor = cPanel,
      border_color = cBorder, border_width = 1, frame_color = cBorder, frame_width = 1)
 
 //@function Writes one dashboard cell.
@@ -1431,7 +1674,7 @@ dcell(int col, int row, string txt, color txtColor, string align) =>
          text_halign = align, bgcolor = color.new(color.black, 100))
 
 renderDashboard() =>
-    table.clear(dash, 0, 0, 4, 25)
+    table.clear(dash, 0, 0, 4, 27)
     int r = 0
 
     // ---- header
@@ -1501,6 +1744,13 @@ renderDashboard() =>
     dcell(4, r, "ATR " + fmt(atr, format.mintick), cMuted, text.align_right)
     r += 1
 
+    dcell(0, r, "STRUCTURE", cMuted, text.align_left)
+    dcell(1, r, structDir == 0 ? "-" : structState, structDir == 0 ? cMuted : structDir > 0 ? cBull : cBear, text.align_left)
+    dcell(2, r, "RANGE", cMuted, text.align_right)
+    dcell(3, r, na(eqLvl) ? "-" : fmt(drLo, format.mintick) + "-" + fmt(drHi, format.mintick), cText, text.align_right)
+    dcell(4, r, pdState, pdState == "Premium" ? cWarn : pdState == "Discount" ? cAccent : cMuted, text.align_right)
+    r += 1
+
     dcell(0, r, "VWAP", cMuted, text.align_left)
     dcell(1, r, vwapValid ? primaryName + " " + str.tostring(vwapVal, format.mintick) : "-",
          vwapValid ? cText : cMuted, text.align_left)
@@ -1544,7 +1794,7 @@ renderDashboard() =>
 //  14. DEBUG FRAMEWORK
 // ============================================================================
 
-var table dbg = table.new(position.bottom_left, 3, 40, bgcolor = cPanel,
+var table dbg = table.new(position.bottom_left, 3, 52, bgcolor = cPanel,
      border_color = cBorder, border_width = 1, frame_color = cBorder, frame_width = 1)
 
 dbgRow(int row, string k, string v, color vc) =>
@@ -1558,7 +1808,7 @@ dbgEngineRow(int row, EngineState e) =>
     table.cell(dbg, 2, row, e.phase + " · " + e.summary, cMuted, text_size = size.tiny, text_halign = text.align_left)
 
 renderDebug() =>
-    table.clear(dbg, 0, 0, 2, 39)
+    table.clear(dbg, 0, 0, 2, 51)
     int r = 0
     table.cell(dbg, 0, r, "ACE DEBUG", cText, text_size = size.tiny, text_halign = text.align_left)
     table.cell(dbg, 1, r, ACE_VERSION, cAccent, text_size = size.tiny, text_halign = text.align_left)
@@ -1622,6 +1872,24 @@ renderDebug() =>
              na(vwapDiffTicks) ? cMuted : vwapDiffTicks < 0.5 ? cBull : cWarn)
         r += 1
         dbgRow(r, "anchored #1/#2", anc1Status + " / " + anc2Status, cText)
+        r += 1
+        dbgRow(r, "swing len / lag", str.tostring(swingLen) + " bars confirmation delay", cWarn)
+        r += 1
+        dbgRow(r, "swings kept", str.tostring(array.size(swings)) + " / " + str.tostring(maxSwings), cText)
+        r += 1
+        dbgRow(r, "last SH / SL", fmt(lastSH, format.mintick) + " / " + fmt(lastSL, format.mintick), cText)
+        r += 1
+        dbgRow(r, "pending hi / lo", (structHiBroken ? "taken" : fmt(structHi, format.mintick)) + " / " + (structLoBroken ? "taken" : fmt(structLo, format.mintick)), cText)
+        r += 1
+        dbgRow(r, "struct dir", structDir == 0 ? "none" : structDir > 0 ? "+1 (up)" : "-1 (down)", structDir == 0 ? cMuted : cText)
+        r += 1
+        dbgRow(r, "last event", na(lastEvBar) ? "-" : evName(lastEvType) + " " + str.tostring(bar_index - lastEvBar) + "b ago", cText)
+        r += 1
+        dbgRow(r, "events kept", str.tostring(array.size(evBar)) + " / " + str.tostring(maxStructEvents), cText)
+        r += 1
+        dbgRow(r, "premium/discount", pdState + " " + fmt(pdPos, "0.000"), cText)
+        r += 1
+        dbgRow(r, "displacement", dispNow ? "yes (body-only, FVG gate in P6)" : "no (body-only, FVG gate in P6)", cMuted)
         r += 1
 
     if dbgEngines
@@ -1744,6 +2012,86 @@ renderProfiles() =>
         putLevel(lvlLines, 5, prevLv, prvProf.startBar, prvProf.endBar, prvProf.val, cMuted, 1, line.style_dotted, false)
 
 // ============================================================================
+//  14c. STRUCTURE RENDER                                                  [P5]
+// ============================================================================
+
+var array<label> swingLabels = array.new<label>()
+var array<label> evLabels    = array.new<label>()
+var array<line>  evLines     = array.new<line>()
+var array<line>  structLines = array.new<line>()
+
+syncLabels(array<label> pool, int need) =>
+    while array.size(pool) > need
+        label.delete(array.pop(pool))
+    while array.size(pool) < need
+        array.push(pool, label.new(bar_index, close, "", style = label.style_none,
+             textcolor = chart.fg_color, size = size.tiny))
+
+renderStructure() =>
+    if not showFacts
+        syncLabels(swingLabels, 0)
+        syncLabels(evLabels, 0)
+        syncLines(evLines, 0)
+        syncLines(structLines, 0)
+    else
+        int firstDrawBar = last_bar_index - maxDrawBars
+
+        // ---- swing sequence labels
+        int nSw = showSwingTags ? array.size(swings) : 0
+        syncLabels(swingLabels, nSw)
+        if nSw > 0
+            for i = 0 to nSw - 1
+                Swing sw = array.get(swings, i)
+                label lb = array.get(swingLabels, i)
+                bool vis = sw.bar >= firstDrawBar
+                label.set_xy(lb, sw.bar, sw.price)
+                label.set_text(lb, vis ? sw.tag : "")
+                label.set_style(lb, sw.isHigh ? label.style_label_down : label.style_label_up)
+                label.set_color(lb, color.new(color.black, 100))
+                label.set_textcolor(lb, vis ? (sw.isHigh ? cBear : cBull) : color.new(cMuted, 100))
+
+        // ---- structure break events
+        int nEv = array.size(evBar)
+        bool evOn = showBos or showChoch or showMss
+        syncLabels(evLabels, evOn ? nEv : 0)
+        syncLines(evLines, evOn ? nEv : 0)
+        if evOn and nEv > 0
+            for i = 0 to nEv - 1
+                int    b  = array.get(evBar, i)
+                float  lv = array.get(evLevel, i)
+                int    et = array.get(evType, i)
+                int    dr = array.get(evDir, i)
+                int    fb = array.get(evFromBar, i)
+                bool typeOn = et == EV_BOS ? showBos : et == EV_CHOCH ? showChoch : showMss
+                bool vis = typeOn and b >= firstDrawBar
+                color col = et == EV_MSS ? cAccent : et == EV_CHOCH ? cWarn : (dr > 0 ? cBull : cBear)
+
+                line ln = array.get(evLines, i)
+                line.set_xy1(ln, fb, lv)
+                line.set_xy2(ln, b, lv)
+                line.set_color(ln, vis ? col : color.new(col, 100))
+                line.set_style(ln, line.style_dashed)
+                line.set_width(ln, 1)
+
+                label lb = array.get(evLabels, i)
+                label.set_xy(lb, b, lv)
+                label.set_text(lb, vis ? evName(et) : "")
+                label.set_style(lb, dr > 0 ? label.style_label_down : label.style_label_up)
+                label.set_color(lb, color.new(color.black, 100))
+                label.set_textcolor(lb, vis ? col : color.new(col, 100))
+
+        // ---- pending levels and the dealing range
+        syncLines(structLines, 5)
+        int x2 = bar_index
+        bool lvOn = showStructLevels
+        putLevel(structLines, 0, lvOn and not structHiBroken, nz(structHiBar, x2), x2, structHi, cBear, 1, line.style_solid, true)
+        putLevel(structLines, 1, lvOn and not structLoBroken, nz(structLoBar, x2), x2, structLo, cBull, 1, line.style_solid, true)
+        bool pdOn = showPremiumDiscount and not na(eqLvl)
+        putLevel(structLines, 2, pdOn, nz(lastSHBar, x2), x2, drHi, color.new(cBear, 40), 1, line.style_dotted, false)
+        putLevel(structLines, 3, pdOn, math.min(nz(lastSHBar, x2), nz(lastSLBar, x2)), x2, eqLvl, cMuted, 1, line.style_dashed, false)
+        putLevel(structLines, 4, pdOn, nz(lastSLBar, x2), x2, drLo, color.new(cBull, 40), 1, line.style_dotted, false)
+
+// ============================================================================
 //  15. RENDER
 // ============================================================================
 
@@ -1756,16 +2104,17 @@ bool inDrawWindow = bar_index > last_bar_index - maxDrawBars
 
 if barstate.islast
     renderProfiles()
+    renderStructure()
 
 if barstate.islast
     if showDash
         renderDashboard()
     else
-        table.clear(dash, 0, 0, 4, 25)
+        table.clear(dash, 0, 0, 4, 27)
     if dbgOn
         renderDebug()
     else
-        table.clear(dbg, 0, 0, 2, 39)
+        table.clear(dbg, 0, 0, 2, 51)
 
 // Keeps the pane scale stable and gives the script a plot to hang alerts on
 // in later phases. Invisible by design.
@@ -1795,5 +2144,14 @@ plot(bandsOn ? bandL2 : na, "VWAP -2σ", color.new(cBear, 65), 1)
 plot(bandsOn ? bandU3 : na, "VWAP +3σ", color.new(cBull, 80), 1)
 plot(bandsOn ? bandL3 : na, "VWAP -3σ", color.new(cBear, 80), 1)
 fill(pU1, pL1, showVwapFill and bandsOn ? color.new(cAccent, 93) : na, title = "VWAP band fill")
+
+// ---- confirmation-delay markers --------------------------------------------
+// The HH/LL label sits where the swing happened; this marker sits where it
+// actually became knowable, `Swing length` bars later. Turning it on is the
+// fastest way to see how much of a pivot chart is hindsight.
+plotchar(showConfirmDelay and showFacts and not na(phRaw) ? 1 : na, "Swing high confirmed here",
+     "v", location.abovebar, cBear, size = size.tiny)
+plotchar(showConfirmDelay and showFacts and not na(plRaw) ? 1 : na, "Swing low confirmed here",
+     "^", location.belowbar, cBull, size = size.tiny)
 
 plot(close, "ACE anchor", display = display.none, editable = false)
