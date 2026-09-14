@@ -34,15 +34,30 @@ STUB = """//  L3 FOOTPRINT ADAPTER - REMOVED IN THE STANDARD BUILD
 //  This build contains no request.footprint() call and therefore runs on every
 //  TradingView plan. The Pro build (build/ACE-Pro.pine) keeps the adapter and
 //  requires a Premium or Ultimate plan. Both are generated from src/ACE.pine.
+//
+//  The stubs below keep the exact signatures and return shapes of the real
+//  adapter, so nothing outside this region differs between the two builds.
+//  Every caller already treats "no footprint data" as a normal condition, which
+//  is what makes deletion a safe build step rather than a code fork.
 
-//@function Always false in the Standard build: no footprint data is requested.
+//@function Always false here: this build requests no footprint data.
 fpAvailable() =>
     false
 
-//@function Inert in the Standard build.
-fpBarContribution(Profile p) =>
-    bool _unused = na(p)
-    false
+//@function Same shape as the Pro adapter: [total, buy, sell, delta].
+fpBarStats() =>
+    [float(na), float(na), float(na), float(na)]
+
+//@function Same shape as the Pro adapter: [ok, volumeAdded].
+fpFillProfile(Profile p, int maxBins) =>
+    bool _unused = na(p) or maxBins < 0
+    [false, 0.0]
+
+//@function Same shape as the Pro adapter:
+//          [buyImbalances, sellImbalances, maxStackLen, stackDir, unfTop, unfBot].
+fpRowStats(int minStack) =>
+    bool _unused = minStack < 0
+    [0, 0, 0, 0, false, false]
 """
 
 
@@ -66,15 +81,35 @@ def make_pro(text: str) -> str:
 
 
 def verify(text: str, name: str) -> None:
-    """Guard the invariant that makes variant B work at all."""
-    code = "\n".join(
-        line.split("//")[0] for line in text.splitlines() if line.split("//")[0].strip()
-    )
+    """Guard the invariants that make variant B work at all."""
+    # Strip comments AND string literals: a token inside a tooltip or a label is
+    # prose, not code, and must not trip the checks.
+    lines = []
+    for line in text.splitlines():
+        code = line.split("//")[0]
+        if code.strip():
+            lines.append(re.sub(r'"[^"]*"', '""', code))
+    code = "\n".join(lines)
+
     for token in ("barmerge.lookahead", "varip"):
         if token in code:
             sys.exit(f"error: {name} contains forbidden token {token!r}")
-    if name == "ACE.pine" and "request.footprint" in code:
-        sys.exit("error: Standard build still calls request.footprint()")
+
+    if name == "ACE.pine":
+        # The Standard build must not reference the footprint API in any form:
+        # merely containing the call locks the script to Premium/Ultimate.
+        if "request.footprint" in code:
+            sys.exit("error: Standard build still calls request.footprint()")
+        if "volume_row" in code:
+            sys.exit("error: Standard build still references the volume_row type")
+        # A declaration like `footprint fpBar = ...`. Enum access such as
+        # `DataSource.footprint` is not a declaration and must not trip this.
+        if re.search(r"(?<![.\w])footprint\s+[A-Za-z_]\w*\s*=", code):
+            sys.exit("error: Standard build still declares a footprint variable")
+    else:
+        # The Pro build must actually contain what it claims to.
+        if "request.footprint" not in code:
+            sys.exit("error: Pro build lost its request.footprint() call")
 
 
 def main() -> int:

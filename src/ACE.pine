@@ -62,8 +62,8 @@ indicator(
 // ============================================================================
 const string ACE_NAME    = "Auction Context Engine"
 const string ACE_SHORT   = "ACE"
-const string ACE_VERSION = "0.5.0-P6"
-const string ACE_PHASE   = "P6 - liquidity + imbalance"
+const string ACE_VERSION = "0.6.0-P7"
+const string ACE_PHASE   = "P7 - volume / order flow"
 const string ACE_BUILD   = "PRO"   // rewritten to "STD" by tools/build.py
 
 // ============================================================================
@@ -354,6 +354,12 @@ bool showHisto = input.bool(true, "Draw profile histogram", group = G_VP)
 float histoWidthPct = input.float(30.0, "Histogram width (% of period)", minval = 5.0, maxval = 100.0, group = G_VP)
 bool extendLevels = input.bool(true, "Extend POC / VA levels to the right", group = G_VP)
 bool showPrevProfile = input.bool(true, "Show previous period profile", group = G_VP)
+bool ltfAuto = input.bool(true, "Auto lower timeframe", group = G_VP, inline = "ltf")
+string ltfManual = input.timeframe("5", "", group = G_VP, inline = "ltf")
+int maxIntrabars = input.int(60, "Max intrabars per bar", minval = 5, maxval = 500, group = G_VP,
+     tooltip = "Safety valve for the L2 path. A daily chart with a 1-minute " +
+               "lower timeframe would loop 1440 times per bar and time out. " +
+               "Auto picks the finest lower timeframe that stays under this.")
 bool showTpo = input.bool(false, "Show TPO (time-at-price) profile", group = G_VP,
      tooltip = "Counts bars per price level instead of volume. Works on instruments " +
                "with no volume data, and is closer to classic Market Profile.")
@@ -460,6 +466,18 @@ DeltaModel deltaModelIn = input.enum(DeltaModel.closePos, "Directional volume mo
 int rvolLen = input.int(20, "Relative volume length", minval = 2, group = G_OF)
 float rvolThr = input.float(1.5, "Relative volume confirm threshold", minval = 0.1, step = 0.1, group = G_OF)
 int atrLen = input.int(14, "ATR length", minval = 1, group = G_OF)
+int fpTicksPerRow = input.int(100, "Footprint: ticks per row", minval = 1, group = G_OF,
+     tooltip = "Pro build only. Row height = this x syminfo.mintick. Only ONE " +
+               "footprint request is allowed per script, so this is a single " +
+               "global setting and cannot differ per profile.")
+float fpImbalancePct = input.float(300.0, "Footprint: imbalance %", minval = 100.0, step = 25.0, group = G_OF,
+     tooltip = "A row has a buy imbalance when its buy volume exceeds the sell " +
+               "volume of the row BELOW it by this percentage (and mirrored for " +
+               "sell imbalances). 300 means three times.")
+int fpMinStack = input.int(3, "Footprint: minimum imbalance stack", minval = 2, maxval = 20, group = G_OF,
+     tooltip = "Consecutive rows imbalanced in the same direction. Shorter runs " +
+               "are reported as no stack.")
+bool useFpImbalance = input.bool(true, "Include footprint imbalances in the score", group = G_OF)
 
 // ---- CONTEXT ENGINE --------------------------------------------------------
 bool enAmt = input.bool(true, "AMT", group = G_CTX, inline = "c1")
@@ -625,85 +643,6 @@ bool isNewMonth = timeframe.change("M")
 bool barConfirmed = confirmClose ? barstate.isconfirmed : true
 
 //@variable Directional volume proxy. NOT order flow - see docs/04-algorithms.md.
-float deltaProxy = na
-if volumeValid
-    if deltaModelIn == DeltaModel.closeDir
-        deltaProxy := close > open ? volume : close < open ? -volume : 0.0
-    else if deltaModelIn == DeltaModel.closePos
-        deltaProxy := high > low ? volume * (2.0 * (close - low) / (high - low) - 1.0) : 0.0
-    // D3 (LTF aggregation) and D4 (footprint) arrive in P7 and stay `na` until then.
-
-// ============================================================================
-//  8. L3 FOOTPRINT ADAPTER                                    [P7 - not active]
-// ----------------------------------------------------------------------------
-//  #region L3 FOOTPRINT ADAPTER
-//
-//  This region is the ONLY place in the script that may touch `request.footprint()`
-//  or the `footprint` / `volume_row` types. Everything else consumes it through
-//  the single entry point `fpBarContribution()`.
-//
-//  WHY IT IS ISOLATED (docs/08-footprint.md section 5):
-//    Merely CONTAINING a request.footprint() call makes the whole script unusable
-//    for Basic / Essential / Plus accounts - TradingView blocks it at the plan
-//    level, it does not simply return na. Deleting this one region therefore
-//    yields a valid all-plans build with zero changes anywhere else.
-//
-//  HARD CONSTRAINTS confirmed against the official v6 documentation:
-//    - exactly ONE request.footprint() call per script (a second raises a
-//      runtime error), and any request.security() whose expression depends on
-//      footprint data counts as that one call;
-//    - `ticks_per_row` is therefore a single global parameter;
-//    - the request always targets the CHART timeframe - session aggregation is
-//      done by our own Profile Engine, not by the footprint;
-//    - buy/sell volume is classified by INTRABAR PRICE DIRECTION, not by
-//      bid/ask aggressor. It is a high-quality proxy, not true order flow;
-//    - footprint data is "repainting by design": granularity degrades with bar
-//      age (1 tick -> 1s -> 1m -> 60m), so closed-bar values can differ after a
-//      chart reload. We call this SOURCE DRIFT and always surface it;
-//    - on timeframes >= 1D, footprint total volume can differ materially from
-//      the `volume` variable (EOD feeds include block/OTC trades).
-//
-//  P0 STATUS: interface only. No request.footprint() call exists yet, so this
-//  build runs on every TradingView plan.
-// ----------------------------------------------------------------------------
-
-//@variable Reports whether L3 data was actually obtained for this bar.
-//          P0 always returns false; P7 replaces the body only.
-fpAvailable() =>
-    false
-
-//@function Single entry point for L3. In P7 this fills the profile bins from
-//          footprint rows; until then it reports "no contribution made".
-//@returns  true when the profile bins were filled from footprint data.
-fpBarContribution(Profile p) =>
-    bool _unused = na(p)
-    false
-
-//  #endregion L3 FOOTPRINT ADAPTER
-// ============================================================================
-
-// ============================================================================
-//  9. DATA SOURCE RESOLUTION
-//     The dashboard must always report what was ACTUALLY used, never what was
-//     requested. Claiming a more precise source than was available would be the
-//     exact kind of dishonesty this project exists to avoid.
-// ============================================================================
-
-string resolvedSource = switch dataSrcIn
-    DataSource.footprint => fpAvailable() ? "FOOTPRINT" : "BAR (footprint unavailable)"
-    DataSource.ltf       => "BAR (LTF arrives in P7)"
-    DataSource.barDist   => "BAR"
-    DataSource.barClose  => "BAR"
-    DataSource.auto      => fpAvailable() ? "FOOTPRINT" : "BAR"
-    => "BAR"
-
-string resolvedDeltaSource = switch deltaModelIn
-    DeltaModel.closeDir => "D1 proxy"
-    DeltaModel.closePos => "D2 proxy"
-    DeltaModel.ltfAgg   => "D3 (P7)"
-    DeltaModel.fpNative => "D4 (P7)"
-    => "unknown"
-
 // ============================================================================
 //  10. ENGINE STATE OBJECTS
 // ============================================================================
@@ -1054,9 +993,12 @@ profBump(Profile p, int i, float vol, float up, float dn, float tpo) =>
         array.set(p.volDn, i, array.get(p.volDn, i) + dn)
         array.set(p.tpo,   i, array.get(p.tpo,   i) + tpo)
 
-//@function Contributes the current bar to the profile.
-//@param    dlt Directional volume proxy, or na when unavailable.
-profAddBar(Profile p, float o, float h, float l, float c, float v, float dlt, DistModel model, int maxBins, int maxBinsPerBar) =>
+//@function Distributes one price range's volume across the bins. Used by the
+//          bar path, by each lower-timeframe intrabar, and never touches
+//          totals or the TPO counter - callers own those.
+//@param    dlt Directional volume, or na when direction is unknown.
+//@returns  Number of bins the range touched.
+profSpread(Profile p, float h, float l, float c, float v, float dlt, DistModel model, int maxBins, int maxBinsPerBar) =>
     profExtend(p, l, h, maxBins)
 
     int iLo = math.max(0, pIndexOf(p, l))
@@ -1069,26 +1011,26 @@ profAddBar(Profile p, float o, float h, float l, float c, float v, float dlt, Di
     float dnTot = dOk ? math.max(0.0, (barVol - dlt) / 2.0) : 0.0
 
     bool degenerate = iHi < iLo or h <= l
-    // Defensive: a single bar spanning an absurd number of bins would make the
-    // per-bar loop the dominant cost. Fall back to close-only and say so.
+    // Defensive: a single range spanning an absurd number of bins would make
+    // this loop the dominant cost. Fall back to close-only and say so.
     bool tooWide = (iHi - iLo) > maxBinsPerBar
     if tooWide
         p.clamped := true
 
     if model == DistModel.closeOnly or degenerate or tooWide
         int i = math.max(0, math.min(p.bins - 1, pIndexOf(p, c)))
-        profBump(p, i, barVol, upTot, dnTot, 1.0)
+        profBump(p, i, barVol, upTot, dnTot, 0.0)
     else
         float mid = (h + l + c) / 3.0
         float half = (h - l) / 2.0
-        // Pass 1: total weight, so the bar contributes exactly `barVol`.
+        // Pass 1: total weight, so the range contributes exactly `barVol`.
         float wSum = 0.0
         for i = iLo to iHi
             float ov = math.min(pBinHigh(p, i), h) - math.max(pBinLow(p, i), l)
             if ov > 0
                 float w = ov / (h - l)
                 if model == DistModel.weighted and half > 0
-                    // Triangular emphasis around the bar's typical price.
+                    // Triangular emphasis around the typical price.
                     w := w * math.max(0.05, 1.0 - math.abs(pBinMid(p, i) - mid) / half)
                 wSum += w
         // Pass 2: apply normalised weights.
@@ -1100,11 +1042,30 @@ profAddBar(Profile p, float o, float h, float l, float c, float v, float dlt, Di
                     if model == DistModel.weighted and half > 0
                         w := w * math.max(0.05, 1.0 - math.abs(pBinMid(p, i) - mid) / half)
                     float k = w / wSum
-                    profBump(p, i, barVol * k, upTot * k, dnTot * k, 1.0)
+                    profBump(p, i, barVol * k, upTot * k, dnTot * k, 0.0)
 
-    p.total    := p.total + barVol
-    p.tpoTotal := p.tpoTotal + (iHi >= iLo ? iHi - iLo + 1 : 1)
-    p.endBar   := bar_index
+    degenerate ? 1 : iHi - iLo + 1
+
+//@function Adds one time-at-price count per bin covered by [l, h].
+//          TPO counts CHART bars, so this is called once per bar regardless of
+//          how the volume itself was sourced.
+profAddTpo(Profile p, float h, float l, int maxBins) =>
+    profExtend(p, l, h, maxBins)
+    int iLo = math.max(0, pIndexOf(p, l))
+    int iHi = math.min(p.bins - 1, pIndexOf(p, h))
+    if iHi >= iLo
+        for i = iLo to iHi
+            array.set(p.tpo, i, array.get(p.tpo, i) + 1.0)
+    int n = iHi >= iLo ? iHi - iLo + 1 : 1
+    p.tpoTotal := p.tpoTotal + n
+    n
+
+//@function Bar-based contribution (data level L0/L1).
+profAddBar(Profile p, float o, float h, float l, float c, float v, float dlt, DistModel model, int maxBins, int maxBinsPerBar) =>
+    profSpread(p, h, l, c, v, dlt, model, maxBins, maxBinsPerBar)
+    profAddTpo(p, h, l, maxBins)
+    p.total  := p.total + nz(v)
+    p.endBar := bar_index
 
 //@function Point of Control. Ties resolve to the bin nearest `refPrice`, then
 //          to the lower index - deterministic, so the POC does not jitter.
@@ -1233,6 +1194,226 @@ profNodes(Profile p, bool useTpo, int win, float hiThr, float loThr) =>
                     array.set(tags, i, -1)
     tags
 
+// ============================================================================
+//  10b-1. DATA SOURCE LAYERS                                              [P7]
+// ----------------------------------------------------------------------------
+//  THREE TIERS, NEVER CONFLATED
+//
+//    L3  REAL FOOTPRINT DATA   request.footprint(). TradingView splits volume
+//                              into "buy" and "sell" server-side, from data as
+//                              fine as 1 tick on eligible plans.
+//                              *** Still classified by INTRABAR PRICE
+//                              DIRECTION, not by bid/ask aggressor. It is the
+//                              best classification available in Pine, and it is
+//                              still not order flow off the book. ***
+//                              Premium/Ultimate only. Pro build only.
+//
+//    L2  LTF PROXY             request.security_lower_tf(). We classify each
+//                              intrabar ourselves by where it closed in its own
+//                              range. Available on every plan; intrabar history
+//                              depth is limited, so old bars fall back to L1.
+//
+//    L1  BAR-BASED PROXY       One OHLCV bar, distributed by model M1/M2/M3 and
+//                              signed by close direction or close position.
+//                              Always available, least informative.
+//
+//  The dashboard always reports the tier ACTUALLY used for the current bar, and
+//  the word "Delta" without a qualifier is never used for L1 or L2.
+// ============================================================================
+
+//  #region L3 FOOTPRINT ADAPTER
+//
+//  The ONLY place in the script allowed to touch request.footprint(), the
+//  `footprint` type or the `volume_row` type. Deleting this region yields the
+//  Standard build (tools/build.py), which runs on every TradingView plan.
+//
+//  HARD CONSTRAINTS (verified against the Pine v6 reference):
+//    - exactly ONE request.footprint() call per script; a second raises a
+//      runtime error, and a request.security() whose expression depends on
+//      footprint data counts as that one call. Hence a single global call here.
+//    - `ticks_per_row` is "simple int": it may come from an input, never from
+//      a series.
+//    - the request always targets the CHART timeframe - no timeframe parameter
+//      exists. Session aggregation stays our Profile Engine's job.
+//    - returns `na` when no footprint exists for the bar, and footprint.*()
+//      rejects `na` ids, so every access is guarded.
+//    - data is "repainting by design": granularity degrades with bar age
+//      (1 tick -> 1s -> 1m -> 60m), so closed-bar values can differ after a
+//      chart reload. We call that SOURCE DRIFT and always surface it.
+
+footprint fpBar = request.footprint(fpTicksPerRow, vaPercent, fpImbalancePct)
+
+//@function Whether real footprint data exists for this bar.
+fpAvailable() =>
+    not na(fpBar)
+
+//@function Bar-level footprint aggregates.
+//@returns  [total, buy, sell, delta]; all na when unavailable.
+fpBarStats() =>
+    float t = na
+    float b = na
+    float sl = na
+    float d = na
+    if not na(fpBar)
+        t  := fpBar.total_volume()
+        b  := fpBar.buy_volume()
+        sl := fpBar.sell_volume()
+        d  := fpBar.delta()
+    [t, b, sl, d]
+
+//@function Pours every footprint row into the profile's bins.
+//@returns  [ok, volumeAdded]
+fpFillProfile(Profile p, int maxBins) =>
+    bool ok = false
+    float added = 0.0
+    if not na(fpBar)
+        array<volume_row> rows = fpBar.rows()
+        int n = array.size(rows)
+        if n > 0
+            for i = 0 to n - 1
+                volume_row r = array.get(rows, i)
+                float up = r.up_price()
+                float dn = r.down_price()
+                float tv = r.total_volume()
+                profExtend(p, dn, up, maxBins)
+                int bi = math.max(0, math.min(p.bins - 1, pIndexOf(p, (up + dn) / 2.0)))
+                profBump(p, bi, tv, r.buy_volume(), r.sell_volume(), 0.0)
+                added += nz(tv)
+            ok := true
+    [ok, added]
+
+//@function Row-level footprint statistics.
+//@returns  [buyImbalances, sellImbalances, maxStackLen, stackDir, unfinishedTop, unfinishedBottom]
+//
+//  IMBALANCE STACK: the longest run of CONSECUTIVE rows carrying an imbalance
+//  in the same direction. Runs shorter than `minStack` are reported as zero.
+//
+//  UNFINISHED AUCTION: the extreme row of the bar still shows volume on BOTH
+//  sides. A finished auction prints one-sided volume at the extreme, because
+//  the last price traded found no opposing interest. This is one formalisation
+//  of a concept with several; it is objective and computable, which the looser
+//  visual definitions are not.
+fpRowStats(int minStack) =>
+    int  buyImb   = 0
+    int  sellImb  = 0
+    int  maxStack = 0
+    int  stackDir = 0
+    bool unfTop   = false
+    bool unfBot   = false
+    if not na(fpBar)
+        array<volume_row> rows = fpBar.rows()
+        int n = array.size(rows)
+        if n > 0
+            int runBuy = 0
+            int runSell = 0
+            for i = 0 to n - 1
+                volume_row r = array.get(rows, i)
+                if r.has_buy_imbalance()
+                    buyImb  += 1
+                    runBuy  += 1
+                else
+                    runBuy  := 0
+                if r.has_sell_imbalance()
+                    sellImb += 1
+                    runSell += 1
+                else
+                    runSell := 0
+                if runBuy > maxStack
+                    maxStack := runBuy
+                    stackDir := 1
+                if runSell > maxStack
+                    maxStack := runSell
+                    stackDir := -1
+            // rows() is sorted ascending by price: index 0 is the low.
+            volume_row rBot = array.get(rows, 0)
+            volume_row rTop = array.get(rows, n - 1)
+            unfBot := rBot.buy_volume() > 0 and rBot.sell_volume() > 0
+            unfTop := rTop.buy_volume() > 0 and rTop.sell_volume() > 0
+            if maxStack < minStack
+                maxStack := 0
+                stackDir := 0
+    [buyImb, sellImb, maxStack, stackDir, unfTop, unfBot]
+
+//  #endregion L3 FOOTPRINT ADAPTER
+
+// ---- L2: lower timeframe ---------------------------------------------------
+
+//@function Largest lower timeframe whose intrabar count stays within budget.
+//          Returns "" when no usable lower timeframe exists (e.g. a 1m chart).
+ltfPick(int cap) =>
+    int cs = timeframe.in_seconds()
+    string r = ""
+    if cs > 60
+        if cs / 60 <= cap
+            r := "1"
+        else if cs / 180 <= cap
+            r := "3"
+        else if cs / 300 <= cap
+            r := "5"
+        else if cs / 900 <= cap
+            r := "15"
+        else if cs / 1800 <= cap
+            r := "30"
+        else if cs / 3600 <= cap
+            r := "60"
+        else
+            r := "240"
+    r
+
+string ltfRes = ltfAuto ? ltfPick(maxIntrabars) : ltfManual
+bool ltfWanted = (dataSrcIn == DataSource.ltf or dataSrcIn == DataSource.auto or
+     deltaModelIn == DeltaModel.ltfAgg) and ltfRes != ""
+
+// `ignore_invalid_timeframe` keeps this harmless when the chart timeframe has
+// no valid lower timeframe: empty arrays come back instead of a runtime error.
+[ltfO, ltfH, ltfL, ltfC, ltfV] = request.security_lower_tf(syminfo.tickerid,
+     ltfRes == "" ? "1" : ltfRes, [open, high, low, close, volume],
+     ignore_invalid_timeframe = true)
+
+int ltfCount = ltfWanted ? array.size(ltfC) : 0
+
+//@function Directional volume of one intrabar, by where it closed in its range.
+//          A PROXY. It is not aggressor data and is never labelled "delta"
+//          without that qualifier.
+intrabarDelta(float o, float h, float l, float c, float v) =>
+    float r = 0.0
+    if not na(v) and v > 0
+        if h > l
+            r := v * (2.0 * (c - l) / (h - l) - 1.0)
+        else
+            r := c > o ? v : c < o ? -v : 0.0
+    r
+
+// ---- directional volume resolution ----------------------------------------
+
+[fpTotal, fpBuy, fpSell, fpDelta] = fpBarStats()
+
+float ltfDelta = na
+if ltfCount > 0
+    float acc = 0.0
+    for k = 0 to ltfCount - 1
+        acc += intrabarDelta(array.get(ltfO, k), array.get(ltfH, k),
+             array.get(ltfL, k), array.get(ltfC, k), array.get(ltfV, k))
+    ltfDelta := acc
+
+float barDelta = na
+if volumeValid
+    if deltaModelIn == DeltaModel.closeDir
+        barDelta := close > open ? volume : close < open ? -volume : 0.0
+    else
+        barDelta := high > low ? volume * (2.0 * (close - low) / (high - low) - 1.0) : 0.0
+
+// Requested tier, with an honest fallback chain. The tier actually used is
+// reported everywhere; we never show a better source than we had.
+string deltaTier = "BAR"
+float deltaProxy = barDelta
+if deltaModelIn == DeltaModel.fpNative and not na(fpDelta)
+    deltaProxy := fpDelta
+    deltaTier  := "FOOTPRINT"
+else if (deltaModelIn == DeltaModel.fpNative or deltaModelIn == DeltaModel.ltfAgg) and not na(ltfDelta)
+    deltaProxy := ltfDelta
+    deltaTier  := "LTF"
+
 // ---- profile period handling ----------------------------------------------
 
 //@variable True on the first bar of a new profile period.
@@ -1259,10 +1440,51 @@ if isNewPeriod or curProf.bins == 0
     float step = math.max(syminfo.mintick, math.round(stepRaw / syminfo.mintick) * syminfo.mintick)
     curProf := profOpen(close, step, resolvedBins, bar_index)
 
+//@variable Which tiers the user is willing to use for the profile.
+bool wantFp  = dataSrcIn == DataSource.footprint or dataSrcIn == DataSource.auto
+bool wantLtf = dataSrcIn == DataSource.ltf or dataSrcIn == DataSource.auto
+
 if curProf.bins > 0
-    profAddBar(curProf, open, high, low, close, volume, deltaProxy, distModel,
-         binCapHard, maxBinsPerBar)
-    curProf.model := resolvedSource
+    bool  doneFp = false
+    float fpVol  = 0.0
+    if wantFp
+        [okFp, volFp] = fpFillProfile(curProf, binCapHard)
+        doneFp := okFp
+        fpVol  := volFp
+
+    if doneFp
+        curProf.total := curProf.total + fpVol
+        profAddTpo(curProf, high, low, binCapHard)
+        curProf.endBar := bar_index
+        curProf.model  := "FOOTPRINT"
+    else if wantLtf and ltfCount > 0
+        float ltfVol = 0.0
+        for k = 0 to ltfCount - 1
+            float ih = array.get(ltfH, k)
+            float il = array.get(ltfL, k)
+            float ic = array.get(ltfC, k)
+            float io = array.get(ltfO, k)
+            float iv = array.get(ltfV, k)
+            profSpread(curProf, ih, il, ic, iv, intrabarDelta(io, ih, il, ic, iv),
+                 distModel, binCapHard, maxBinsPerBar)
+            ltfVol += nz(iv)
+        curProf.total := curProf.total + ltfVol
+        profAddTpo(curProf, high, low, binCapHard)
+        curProf.endBar := bar_index
+        curProf.model  := "LTF"
+    else
+        profAddBar(curProf, open, high, low, close, volume, deltaProxy, distModel,
+             binCapHard, maxBinsPerBar)
+        curProf.model := "BAR"
+
+//@variable The tier ACTUALLY used for the current bar's profile contribution.
+//          Never the requested one - showing a better source than we had would
+//          be exactly the kind of dishonesty this project exists to avoid.
+string resolvedSource = curProf.bins > 0 ? curProf.model : "none"
+
+string resolvedDeltaSource = deltaTier == "FOOTPRINT" ? "Footprint (price-direction classified)" :
+     deltaTier == "LTF" ? "LTF proxy" :
+     deltaModelIn == DeltaModel.closeDir ? "Bar proxy D1" : "Bar proxy D2"
 
 // Developing POC / VA: recomputed on a schedule, not every tick.
 var float devPoc = na
@@ -1896,6 +2118,83 @@ else
     engLiq.summary := showEqual or showPools ? "no levels yet" : "liquidity display off"
 
 // ============================================================================
+//  10f. ORDER FLOW ENGINE                                                 [P7]
+// ----------------------------------------------------------------------------
+//  FACT ONLY. Emits magnitudes, counts and which side they belong to. The sign
+//  conventions live in the Context Engine, as with Liquidity and Imbalance.
+//
+//  TERMINOLOGY DISCIPLINE
+//  "Delta" without a qualifier is reserved for the footprint tier, and even
+//  there it means volume classified by intrabar price direction - NOT by
+//  bid/ask aggressor, which Pine cannot see at all. L2 and L1 values are called
+//  proxies everywhere they appear: in the code, the dashboard and the docs.
+// ============================================================================
+
+// ---- session cumulative directional volume ---------------------------------
+
+var float cumDelta    = 0.0
+var float cumAbsDelta = 0.0
+if isNewDay
+    cumDelta    := 0.0
+    cumAbsDelta := 0.0
+if not na(deltaProxy)
+    cumDelta    := cumDelta + deltaProxy
+    cumAbsDelta := cumAbsDelta + math.abs(deltaProxy)
+
+//@variable Session directional volume normalised by the volume that actually
+//          carried a direction. Range -1..+1. na before anything accumulates.
+float cumDeltaNorm = cumAbsDelta > 0 ? cumDelta / cumAbsDelta : na
+
+//@variable Relative volume, saturated at the user's confirmation threshold.
+float rvolFactor = na(rvol) or rvolThr <= 0 ? na : math.min(rvol / rvolThr, 1.0)
+
+// ---- footprint row statistics (Pro build; zeros in the Standard build) -----
+
+[ofBuyImb, ofSellImb, ofStackLen, ofStackDir, ofUnfTop, ofUnfBot] = fpRowStats(fpMinStack)
+
+//@variable True when this bar's numbers came from real footprint data.
+bool ofFootprint = deltaTier == "FOOTPRINT"
+
+//@variable Price/flow divergence: a new session extreme in price that the
+//          cumulative directional volume did not confirm. Reported as a fact;
+//          what it means is not decided here.
+var float sessHigh = na
+var float sessLow = na
+var float cumAtHigh = na
+var float cumAtLow = na
+if isNewDay
+    sessHigh  := high
+    sessLow   := low
+    cumAtHigh := cumDelta
+    cumAtLow  := cumDelta
+else
+    if high > nz(sessHigh, high)
+        sessHigh  := high
+        cumAtHigh := cumDelta
+    if low < nz(sessLow, low)
+        sessLow   := low
+        cumAtLow  := cumDelta
+
+bool ofDivergeUp = not na(sessHigh) and high >= sessHigh and cumDelta < nz(cumAtHigh, cumDelta)
+bool ofDivergeDn = not na(sessLow) and low <= sessLow and cumDelta > nz(cumAtLow, cumDelta)
+
+//@variable Is there anything at all to report?
+bool ofHasData = volumeValid and not na(cumDeltaNorm)
+
+string ofState = "-"
+if ofHasData
+    ofState := (cumDeltaNorm > 0 ? "+" : "") + str.tostring(cumDeltaNorm * 100, "0") + "% cum, RVOL " +
+         str.tostring(nz(rvol), "0.0")
+    if ofStackLen > 0
+        ofState := ofState + ", stack " + str.tostring(ofStackLen) + (ofStackDir > 0 ? " buy" : " sell")
+
+engVol.ready := ofHasData
+if ofHasData
+    engVol.summary := deltaTier + " tier, " + ofState
+else
+    engVol.summary := volumeValid ? "warming up" : "no volume data"
+
+// ============================================================================
 //  11. CONTEXT ENGINE
 //      Turns engine FACTS into normalised component scores in [-1, +1].
 //      A component with no data reports valid = false and is excluded from the
@@ -1942,8 +2241,22 @@ else if liqHasData
 
 float imbComposed = imbHasData ? clamp(imbUpScore - imbDnScore, -1.0, 1.0) : na
 
+//   Order flow: cumulative directional volume sets the sign, relative volume
+//   scales it (flow without participation is weak evidence), and a footprint
+//   imbalance stack nudges it toward the stacked side. All three conventions
+//   are this layer's, not the engine's.
+float volComposed = na
+if ofHasData
+    float mag = math.min(math.abs(cumDeltaNorm) / 0.5, 1.0)
+    float rf = na(rvolFactor) ? 1.0 : rvolFactor
+    volComposed := math.sign(cumDeltaNorm) * mag * rf
+    if useFpImbalance and ofStackDir != 0 and ofFootprint
+        float stackMag = math.min(ofStackLen / (fpMinStack * 2.0), 1.0)
+        volComposed := clamp(volComposed + 0.25 * ofStackDir * stackMag, -1.0, 1.0)
+
 float liqRawHeld    = hold(liqComposed)
 float imbRawHeld    = hold(imbComposed)
+float volRawHeld    = hold(volComposed)
 
 buildComponents() =>
     array<Component> c = array.new<Component>()
@@ -1957,7 +2270,7 @@ buildComponents() =>
         vp.valid  := true
         vp.raw    := clamp(valuePosHeld, -1.0, 1.0)
         vp.state  := valueState
-        vp.approx := resolvedSource == "FOOTPRINT"
+        vp.approx := resolvedSource == "FOOTPRINT" or resolvedSource == "LTF"
         vp.reason := (useTpoSrc ? "TPO" : "volume") + " profile, POC " +
              str.tostring(curProf.poc, format.mintick)
     else
@@ -2018,8 +2331,21 @@ buildComponents() =>
         // No tracked gap is an absence of evidence, not a balanced market.
         im.reason := showFvg ? "no active FVG" : "FVG detection off"
     c.push(im)
-    c.push(Component.new(name = "Volume", weight = wVol, enabled = enVol,
-         state = "-", reason = "engine arrives in P7"))
+    // --- Order flow / Volume: live as of P7 ---
+    Component vo = Component.new(name = "Volume", weight = wVol, enabled = enVol)
+    if not na(volRawHeld)
+        vo.valid  := true
+        vo.raw    := clamp(volRawHeld, -1.0, 1.0)
+        vo.state  := ofState
+        // Source drift: footprint and LTF data can differ after a reload.
+        vo.approx := deltaTier != "BAR"
+        vo.reason := deltaTier == "FOOTPRINT" ?
+             "footprint tier (price-direction classified, not bid/ask)" :
+             deltaTier == "LTF" ? "LTF proxy tier" : "bar proxy tier"
+    else
+        vo.state  := "-"
+        vo.reason := volumeValid ? "no directional volume yet" : "no volume data"
+    c.push(vo)
     c
 
 // ============================================================================
@@ -2091,7 +2417,7 @@ var array<float> prevContrib = array.new<float>(7, 0.0)
 //  13. DASHBOARD
 // ============================================================================
 
-var table dash = table.new(dashPosStr, 5, 30, bgcolor = cPanel,
+var table dash = table.new(dashPosStr, 5, 32, bgcolor = cPanel,
      border_color = cBorder, border_width = 1, frame_color = cBorder, frame_width = 1)
 
 //@function Writes one dashboard cell.
@@ -2100,7 +2426,7 @@ dcell(int col, int row, string txt, color txtColor, string align) =>
          text_halign = align, bgcolor = color.new(color.black, 100))
 
 renderDashboard() =>
-    table.clear(dash, 0, 0, 4, 29)
+    table.clear(dash, 0, 0, 4, 31)
     int r = 0
 
     // ---- header
@@ -2170,6 +2496,13 @@ renderDashboard() =>
     dcell(4, r, "ATR " + fmt(atr, format.mintick), cMuted, text.align_right)
     r += 1
 
+    dcell(0, r, "ORDER FLOW", cMuted, text.align_left)
+    dcell(1, r, ofState, ofHasData ? cText : cMuted, text.align_left)
+    dcell(2, r, "TIER", cMuted, text.align_right)
+    dcell(3, r, deltaTier, deltaTier == "BAR" ? cMuted : cWarn, text.align_right)
+    dcell(4, r, ofUnfTop or ofUnfBot ? "unfinished " + (ofUnfTop ? "hi" : "") + (ofUnfBot ? " lo" : "") : "", cWarn, text.align_right)
+    r += 1
+
     dcell(0, r, "LIQUIDITY", cMuted, text.align_left)
     dcell(1, r, liqState, liqHasData ? cText : cMuted, text.align_left)
     dcell(2, r, "FVG", cMuted, text.align_right)
@@ -2204,7 +2537,7 @@ renderDashboard() =>
     dcell(1, r, resolvedSource, resolvedSource == "FOOTPRINT" ? cWarn : cText, text.align_left)
     dcell(2, r, "VOLUME", cMuted, text.align_right)
     dcell(3, r, volumeValid ? "OK" : "MISSING", volumeValid ? cBull : cWarn, text.align_right)
-    dcell(4, r, useTpoSrc ? "TPO" : "VOL", useTpoSrc ? cWarn : cMuted, text.align_right)
+    dcell(4, r, resolvedDeltaSource, cMuted, text.align_right)
     r += 1
 
     if histoBudgetHit
@@ -2235,7 +2568,7 @@ renderDashboard() =>
 //  14. DEBUG FRAMEWORK
 // ============================================================================
 
-var table dbg = table.new(position.bottom_left, 3, 66, bgcolor = cPanel,
+var table dbg = table.new(position.bottom_left, 3, 80, bgcolor = cPanel,
      border_color = cBorder, border_width = 1, frame_color = cBorder, frame_width = 1)
 
 dbgRow(int row, string k, string v, color vc) =>
@@ -2249,7 +2582,7 @@ dbgEngineRow(int row, EngineState e) =>
     table.cell(dbg, 2, row, e.phase + " · " + e.summary, cMuted, text_size = size.tiny, text_halign = text.align_left)
 
 renderDebug() =>
-    table.clear(dbg, 0, 0, 2, 65)
+    table.clear(dbg, 0, 0, 2, 79)
     int r = 0
     table.cell(dbg, 0, r, "ACE DEBUG", cText, text_size = size.tiny, text_halign = text.align_left)
     table.cell(dbg, 1, r, ACE_VERSION, cAccent, text_size = size.tiny, text_halign = text.align_left)
@@ -2269,10 +2602,7 @@ renderDebug() =>
         r += 1
         dbgRow(r, "profile source", resolvedSource, cText)
         r += 1
-        dbgRow(r, "delta source", resolvedDeltaSource, cText)
-        r += 1
-        dbgRow(r, "delta value", fmt(deltaProxy, format.volume), cText)
-        r += 1
+
         dbgRow(r, "rvol", fmt(rvol, "0.00"), cText)
         r += 1
         dbgRow(r, "perf mode", str.tostring(perfMode), cText)
@@ -2351,6 +2681,26 @@ renderDebug() =>
         dbgRow(r, "prev day hi/lo", fmt(prevDayHi, format.mintick) + " / " + fmt(prevDayLo, format.mintick), cText)
         r += 1
         dbgRow(r, "order blocks", "not implemented (input is inert)", cWarn)
+        r += 1
+        dbgRow(r, "ltf resolution", ltfRes == "" ? "none available" : ltfRes + " x" + str.tostring(ltfCount), ltfCount > 0 ? cText : cMuted)
+        r += 1
+        dbgRow(r, "footprint", fpAvailable() ? "available" : "unavailable (STD build or plan/data)", fpAvailable() ? cBull : cMuted)
+        r += 1
+        dbgRow(r, "fp bar b/s/d", fmt(fpBuy, format.volume) + " / " + fmt(fpSell, format.volume) + " / " + fmt(fpDelta, format.volume), cText)
+        r += 1
+        dbgRow(r, "delta tier", deltaTier + " - " + resolvedDeltaSource, deltaTier == "BAR" ? cMuted : cWarn)
+        r += 1
+        dbgRow(r, "delta value", fmt(deltaProxy, format.volume), cText)
+        r += 1
+        dbgRow(r, "cum delta", fmt(cumDelta, format.volume) + " norm " + fmt(cumDeltaNorm, "0.000"), cText)
+        r += 1
+        dbgRow(r, "fp imbalances", "buy " + str.tostring(ofBuyImb) + " sell " + str.tostring(ofSellImb), cText)
+        r += 1
+        dbgRow(r, "fp stack", ofStackLen == 0 ? "none (min " + str.tostring(fpMinStack) + ")" : str.tostring(ofStackLen) + (ofStackDir > 0 ? " buy" : " sell"), ofStackLen > 0 ? cWarn : cMuted)
+        r += 1
+        dbgRow(r, "unfinished auction", (ofUnfTop ? "top " : "") + (ofUnfBot ? "bottom" : "") + (ofUnfTop or ofUnfBot ? "" : "none"), ofUnfTop or ofUnfBot ? cWarn : cMuted)
+        r += 1
+        dbgRow(r, "flow divergence", ofDivergeUp ? "high unconfirmed" : ofDivergeDn ? "low unconfirmed" : "none", ofDivergeUp or ofDivergeDn ? cWarn : cMuted)
         r += 1
 
     if dbgEngines
@@ -2673,11 +3023,11 @@ if barstate.islast
     if showDash
         renderDashboard()
     else
-        table.clear(dash, 0, 0, 4, 29)
+        table.clear(dash, 0, 0, 4, 31)
     if dbgOn
         renderDebug()
     else
-        table.clear(dbg, 0, 0, 2, 65)
+        table.clear(dbg, 0, 0, 2, 79)
 
 // Keeps the pane scale stable and gives the script a plot to hang alerts on
 // in later phases. Invisible by design.
