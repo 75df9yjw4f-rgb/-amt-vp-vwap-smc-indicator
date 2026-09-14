@@ -62,8 +62,8 @@ indicator(
 // ============================================================================
 const string ACE_NAME    = "Auction Context Engine"
 const string ACE_SHORT   = "ACE"
-const string ACE_VERSION = "0.2.0-P1"
-const string ACE_PHASE   = "P1 - profile engine"
+const string ACE_VERSION = "0.3.0-P3"
+const string ACE_PHASE   = "P3 - vwap engine"
 const string ACE_BUILD   = "PRO"   // rewritten to "STD" by tools/build.py
 
 // ============================================================================
@@ -127,6 +127,40 @@ enum DeltaModel
     closePos = "D2 - Close position in range"
     ltfAgg   = "D3 - Lower timeframe aggregation"
     fpNative = "D4 - Footprint (Premium+)"
+
+//@enum Price series a VWAP is weighted on. hlc3 matches the built-in ta.vwap.
+enum VwapSource
+    hlc3  = "hlc3 (matches ta.vwap)"
+    close = "close"
+    hl2   = "hl2"
+    ohlc4 = "ohlc4"
+
+//@enum Anchor for an Anchored VWAP.
+enum AnchorMode
+    dateTime      = "Date / time"
+    sessionOpen   = "Session open"
+    weekOpen      = "Week open"
+    monthOpen     = "Month open"
+    yearOpen      = "Year open"
+    highestHigh   = "Highest high in lookback"
+    lowestLow     = "Lowest low in lookback"
+    lastSwingHigh = "Last swing high (needs P5)"
+    lastSwingLow  = "Last swing low (needs P5)"
+    lastBos       = "Last BOS (needs P5)"
+
+//@enum How the VWAP bands are sized.
+enum BandMode
+    stdev   = "Standard deviation"
+    percent = "Percentage"
+
+//@enum Which VWAP the bands, z-score and score component refer to.
+enum PrimaryVwap
+    session = "Session"
+    daily   = "Daily"
+    weekly  = "Weekly"
+    monthly = "Monthly"
+    anchor1 = "Anchored #1"
+    anchor2 = "Anchored #2"
 
 //@enum Colour theme.
 enum Theme
@@ -319,15 +353,40 @@ bool showTpo = input.bool(false, "Show TPO (time-at-price) profile", group = G_V
                "with no volume data, and is closer to classic Market Profile.")
 
 // ---- VWAP ------------------------------------------------------------------
-bool useSessionVwap = input.bool(true, "Session VWAP", group = G_VWAP, inline = "v1")
+VwapSource vwapSrcIn = input.enum(VwapSource.hlc3, "Source", group = G_VWAP,
+     tooltip = "hlc3 is what the built-in ta.vwap uses. Change it only if you " +
+               "specifically want a different weighting - the Session VWAP will " +
+               "then no longer match the platform reference.")
+PrimaryVwap primaryVwap = input.enum(PrimaryVwap.session, "Primary VWAP (bands, z-score, score)", group = G_VWAP)
+bool useSessionVwap = input.bool(true, "Session", group = G_VWAP, inline = "v1")
+bool useDailyVwap = input.bool(false, "Daily", group = G_VWAP, inline = "v1")
 bool useWeeklyVwap = input.bool(false, "Weekly", group = G_VWAP, inline = "v1")
-bool useMonthlyVwap = input.bool(false, "Monthly", group = G_VWAP, inline = "v1")
+bool useMonthlyVwap = input.bool(false, "Monthly", group = G_VWAP, inline = "v1",
+     tooltip = "Session resets at the trading-session open (same rule as ta.vwap). " +
+               "Daily resets at the calendar day in exchange time. On 24h symbols " +
+               "the two coincide; on futures with an evening open they do not.")
 bool showVwapBands = input.bool(true, "Deviation bands", group = G_VWAP, inline = "v2")
 float vwapDev1 = input.float(1.0, "", minval = 0.1, step = 0.1, group = G_VWAP, inline = "v2")
 float vwapDev2 = input.float(2.0, "", minval = 0.1, step = 0.1, group = G_VWAP, inline = "v2")
 float vwapDev3 = input.float(3.0, "", minval = 0.1, step = 0.1, group = G_VWAP, inline = "v2")
-bool useAnchored1 = input.bool(false, "Anchored VWAP #1", group = G_VWAP)
-bool useAnchored2 = input.bool(false, "Anchored VWAP #2", group = G_VWAP)
+BandMode bandMode = input.enum(BandMode.stdev, "Band mode", group = G_VWAP,
+     tooltip = "Standard deviation is volume weighted around the current mean, " +
+               "computed from accumulated moments (sumP2V/sumV - vwap^2). " +
+               "Percentage is a fixed fraction of the VWAP price.")
+bool showVwapFill = input.bool(true, "Shade the first band", group = G_VWAP)
+float zSaturation = input.float(2.0, "Z-score saturation for scoring", minval = 0.5, step = 0.1, group = G_VWAP,
+     tooltip = "The VWAP score reaches its maximum at this many sigma. " +
+               "Higher = the component saturates more slowly.")
+
+bool useAnchored1 = input.bool(false, "Anchored VWAP #1", group = G_VWAP, inline = "a1")
+AnchorMode anc1Mode = input.enum(AnchorMode.dateTime, "", group = G_VWAP, inline = "a1")
+int anc1Time = input.time(timestamp("01 Jan 2024 00:00 +0000"), "Anchor #1 date", group = G_VWAP)
+int anc1Lookback = input.int(200, "Anchor #1 extreme lookback", minval = 5, maxval = 500, group = G_VWAP)
+
+bool useAnchored2 = input.bool(false, "Anchored VWAP #2", group = G_VWAP, inline = "a2")
+AnchorMode anc2Mode = input.enum(AnchorMode.highestHigh, "", group = G_VWAP, inline = "a2")
+int anc2Time = input.time(timestamp("01 Jan 2024 00:00 +0000"), "Anchor #2 date", group = G_VWAP)
+int anc2Lookback = input.int(200, "Anchor #2 extreme lookback", minval = 5, maxval = 500, group = G_VWAP)
 
 // ---- MARKET STRUCTURE ------------------------------------------------------
 int swingLen = input.int(5, "Swing length", minval = 1, maxval = 50, group = G_MS,
@@ -512,6 +571,12 @@ fmt(float v, string f) =>
 //@function Formats a signed score as "+0.00" / "-0.00".
 fmtSigned(float v) =>
     na(v) ? "-" : (v >= 0 ? "+" : "") + str.tostring(v, "0.00")
+
+//@function Freezes a value inside an unconfirmed bar when Confirm-on-close is
+//          on, so scores cannot flicker tick by tick. This is a display and
+//          scoring gate only - it never reaches back into closed bars.
+hold(float v) =>
+    confirmClose and not barstate.isconfirmed ? nz(v[1], v) : v
 
 //@function Internal assertion. Fails loudly rather than producing silent nonsense.
 assert(bool condition, string message) =>
@@ -987,11 +1052,291 @@ if curProf.ready and not na(curProf.vah) and not na(curProf.val) and curProf.vah
                       close < curProf.poc ? "In value (below POC)" : "At POC"
 
 // ============================================================================
+//  10c. VWAP ENGINE                                                       [P3]
+// ----------------------------------------------------------------------------
+//  ACCUMULATION - why the second moment, not a running deviation
+//
+//  The standard deviation of a VWAP must be volume weighted around the FINAL
+//  mean, not around the mean as it was when each bar arrived. Accumulating
+//  (src - vwap_running)^2 understates the band width systematically, because
+//  early bars are measured against a mean that no longer exists.
+//
+//  This engine accumulates raw weighted moments instead:
+//
+//      sumV   = SUM(v)
+//      sumPV  = SUM(src * v)
+//      sumP2V = SUM(src^2 * v)
+//
+//      vwap   = sumPV / sumV
+//      var    = sumP2V / sumV - vwap^2          (weighted second moment)
+//      sigma  = sqrt(max(var, 0))
+//
+//  Every bar therefore contributes exactly once, in O(1), and the deviation is
+//  always measured against the current mean. `max(var, 0)` guards the one real
+//  hazard of this identity: catastrophic cancellation when the two terms are
+//  nearly equal can produce a tiny negative variance.
+//
+//  FACT ONLY: this engine emits prices, a sigma, a z-score and a position
+//  label. It does not decide whether being above the VWAP is bullish.
+// ============================================================================
+
+//@type One VWAP accumulator: an anchor plus its weighted moments.
+type VwapAcc
+    float sumPV    = 0.0
+    float sumV     = 0.0
+    float sumP2V   = 0.0
+    float vwap     = na
+    float sd       = na
+    int   anchorBar = na
+    bool  active   = false
+    bool  valid    = false
+
+//@variable Price series the VWAP is weighted on. hlc3 matches `ta.vwap`.
+float vwapSrc = switch vwapSrcIn
+    VwapSource.hlc3  => hlc3
+    VwapSource.close => close
+    VwapSource.hl2   => hl2
+    VwapSource.ohlc4 => ohlc4
+    => hlc3
+
+//@function Clears an accumulator and anchors it to the current bar.
+vwapReset(VwapAcc a) =>
+    a.sumPV     := 0.0
+    a.sumV      := 0.0
+    a.sumP2V    := 0.0
+    a.vwap      := na
+    a.sd        := na
+    a.anchorBar := bar_index
+    a.active    := true
+    a.valid     := false
+
+//@function Adds one bar to an accumulator and refreshes vwap / sigma.
+vwapAdd(VwapAcc a, float src, float vol) =>
+    if a.active and not na(src) and not na(vol) and vol > 0
+        a.sumPV  := a.sumPV + src * vol
+        a.sumV   := a.sumV + vol
+        a.sumP2V := a.sumP2V + src * src * vol
+        if a.sumV > 0
+            a.vwap := a.sumPV / a.sumV
+            float m2 = a.sumP2V / a.sumV
+            a.sd    := math.sqrt(math.max(m2 - a.vwap * a.vwap, 0.0))
+            a.valid := true
+
+//@function Rebuilds an accumulator from `back` bars ago up to the current bar.
+//          Used by anchors that can move (highest high, lowest low).
+vwapRebuild(VwapAcc a, int back) =>
+    a.sumPV     := 0.0
+    a.sumV      := 0.0
+    a.sumP2V    := 0.0
+    a.vwap      := na
+    a.sd        := na
+    a.anchorBar := bar_index - back
+    a.active    := true
+    a.valid     := false
+    if back >= 0
+        for i = back to 0
+            float s = vwapSrc[i]
+            float v = nz(volume[i])
+            if not na(s) and v > 0
+                a.sumPV  := a.sumPV + s * v
+                a.sumV   := a.sumV + v
+                a.sumP2V := a.sumP2V + s * s * v
+        if a.sumV > 0
+            a.vwap := a.sumPV / a.sumV
+            float m2 = a.sumP2V / a.sumV
+            a.sd    := math.sqrt(math.max(m2 - a.vwap * a.vwap, 0.0))
+            a.valid := true
+
+// ---- period anchors --------------------------------------------------------
+// All of these look only at the CURRENT and PREVIOUS bar. No lookahead, no
+// request.security(), so nothing here can leak future data.
+
+//@variable New trading session / day, as `ta.vwap` defines it.
+bool vwapNewSession = na(time[1]) or time("D") != time("D")[1]
+//@variable New CALENDAR day in exchange time. On 24h instruments this
+//          coincides with the session anchor; on futures with an evening open
+//          it genuinely differs, which is the whole point of having both.
+bool vwapNewCalDay = na(time[1]) or dayofmonth != dayofmonth[1]
+bool vwapNewWeek = na(time[1]) or time("W") != time("W")[1]
+bool vwapNewMonth = na(time[1]) or time("M") != time("M")[1]
+
+var VwapAcc accSession = VwapAcc.new()
+var VwapAcc accDaily   = VwapAcc.new()
+var VwapAcc accWeekly  = VwapAcc.new()
+var VwapAcc accMonthly = VwapAcc.new()
+var VwapAcc accAnc1    = VwapAcc.new()
+var VwapAcc accAnc2    = VwapAcc.new()
+
+if vwapNewSession
+    vwapReset(accSession)
+if vwapNewCalDay
+    vwapReset(accDaily)
+if vwapNewWeek
+    vwapReset(accWeekly)
+if vwapNewMonth
+    vwapReset(accMonthly)
+
+vwapAdd(accSession, vwapSrc, volume)
+vwapAdd(accDaily,   vwapSrc, volume)
+vwapAdd(accWeekly,  vwapSrc, volume)
+vwapAdd(accMonthly, vwapSrc, volume)
+
+// ---- anchored VWAP ---------------------------------------------------------
+
+//@function Applies one anchor mode to an accumulator.
+//@returns  A status string: "ok", or why the anchor produced no data.
+vwapApplyAnchor(VwapAcc a, AnchorMode mode, int anchorTime, int lookback) =>
+    string status = "ok"
+    if mode == AnchorMode.dateTime
+        if time >= anchorTime and (na(time[1]) or time[1] < anchorTime)
+            vwapReset(a)
+        if not a.active
+            status := "waiting for anchor date"
+        vwapAdd(a, vwapSrc, volume)
+    else if mode == AnchorMode.sessionOpen
+        if vwapNewSession
+            vwapReset(a)
+        vwapAdd(a, vwapSrc, volume)
+    else if mode == AnchorMode.weekOpen
+        if vwapNewWeek
+            vwapReset(a)
+        vwapAdd(a, vwapSrc, volume)
+    else if mode == AnchorMode.monthOpen
+        if vwapNewMonth
+            vwapReset(a)
+        vwapAdd(a, vwapSrc, volume)
+    else if mode == AnchorMode.yearOpen
+        if na(time[1]) or year != year[1]
+            vwapReset(a)
+        vwapAdd(a, vwapSrc, volume)
+    else if mode == AnchorMode.highestHigh
+        int back = int(math.abs(nz(ta.highestbars(high, lookback), 0)))
+        if na(a.anchorBar) or bar_index - back != a.anchorBar
+            vwapRebuild(a, back)
+        else
+            vwapAdd(a, vwapSrc, volume)
+    else if mode == AnchorMode.lowestLow
+        int back = int(math.abs(nz(ta.lowestbars(low, lookback), 0)))
+        if na(a.anchorBar) or bar_index - back != a.anchorBar
+            vwapRebuild(a, back)
+        else
+            vwapAdd(a, vwapSrc, volume)
+    else
+        // Structure-based anchors are honest about not existing yet.
+        status := "needs Structure Engine (P5)"
+    status
+
+string anc1Status = useAnchored1 ? vwapApplyAnchor(accAnc1, anc1Mode, anc1Time, anc1Lookback) : "off"
+string anc2Status = useAnchored2 ? vwapApplyAnchor(accAnc2, anc2Mode, anc2Time, anc2Lookback) : "off"
+
+// ---- primary VWAP selection ------------------------------------------------
+
+//@function Picks the accumulator the bands, z-score and score refer to.
+vwapPrimary() =>
+    VwapAcc a = accSession
+    if primaryVwap == PrimaryVwap.daily
+        a := accDaily
+    else if primaryVwap == PrimaryVwap.weekly
+        a := accWeekly
+    else if primaryVwap == PrimaryVwap.monthly
+        a := accMonthly
+    else if primaryVwap == PrimaryVwap.anchor1
+        a := accAnc1
+    else if primaryVwap == PrimaryVwap.anchor2
+        a := accAnc2
+    a
+
+VwapAcc primary = vwapPrimary()
+
+//@variable The primary VWAP is usable only with real volume behind it.
+//          Without volume a "VWAP" is just a moving average of price and must
+//          not be presented as a VWAP - it reports NO DATA instead.
+bool vwapValid = volumeValid and primary.valid and not na(primary.vwap)
+
+float vwapVal = vwapValid ? primary.vwap : na
+float vwapSd  = vwapValid ? primary.sd : na
+
+// σ bands. Percentage mode is offered for instruments where a volume-weighted
+// sigma is degenerate (very low trade counts per bar).
+vwapBand(float mult, int sign) =>
+    float r = na
+    if vwapValid
+        if bandMode == BandMode.stdev
+            r := not na(vwapSd) ? vwapVal + sign * mult * vwapSd : na
+        else
+            r := vwapVal * (1.0 + sign * mult / 100.0)
+    r
+
+float bandU1 = vwapBand(vwapDev1, 1)
+float bandL1 = vwapBand(vwapDev1, -1)
+float bandU2 = vwapBand(vwapDev2, 1)
+float bandL2 = vwapBand(vwapDev2, -1)
+float bandU3 = vwapBand(vwapDev3, 1)
+float bandL3 = vwapBand(vwapDev3, -1)
+
+// ---- FACT outputs ----------------------------------------------------------
+
+//@variable Standardised distance of price from the VWAP. na when sigma is 0,
+//          which happens on the anchor bar itself - that is NO DATA, not 0.
+float vwapZ = vwapValid and not na(vwapSd) and vwapSd > 0 ? (close - vwapVal) / vwapSd : na
+
+//@variable Which sigma band price currently occupies.
+string vwapZone = "-"
+if not na(vwapZ)
+    float az = math.abs(vwapZ)
+    string side = vwapZ > 0 ? "above" : "below"
+    if az <= vwapDev1
+        vwapZone := "inside " + str.tostring(vwapDev1, "0.#") + " sigma"
+    else if az <= vwapDev2
+        vwapZone := str.tostring(vwapDev1, "0.#") + "-" + str.tostring(vwapDev2, "0.#") + " sigma " + side
+    else if az <= vwapDev3
+        vwapZone := str.tostring(vwapDev2, "0.#") + "-" + str.tostring(vwapDev3, "0.#") + " sigma " + side
+    else
+        vwapZone := "beyond " + str.tostring(vwapDev3, "0.#") + " sigma " + side
+
+//@variable Plain position of price relative to the VWAP.
+string vwapPos = not vwapValid ? "-" : close > vwapVal ? "Above" : close < vwapVal ? "Below" : "At"
+
+// ---- built-in cross-check --------------------------------------------------
+// `ta.vwap` is the reference implementation. Keeping a live difference readout
+// in the debug panel makes the accuracy claim verifiable by the user instead
+// of something they have to take on trust.
+float refVwap = volumeValid ? ta.vwap(hlc3) : na
+float vwapDiffTicks = not na(refVwap) and accSession.valid and syminfo.mintick > 0 ?
+     math.abs(accSession.vwap - refVwap) / syminfo.mintick : na
+
+engVwap.ready := vwapValid
+if vwapValid
+    engVwap.summary := str.tostring(primary.vwap, format.mintick) + ", σ " + str.tostring(nz(vwapSd), format.mintick)
+else
+    engVwap.summary := volumeValid ? "warming up" : "no volume data"
+
+// ============================================================================
 //  11. CONTEXT ENGINE
 //      Turns engine FACTS into normalised component scores in [-1, +1].
 //      A component with no data reports valid = false and is excluded from the
 //      scoring denominator entirely (INVARIANT #2).
 // ============================================================================
+
+//@variable Human-readable name of the VWAP the score refers to.
+string primaryName = switch primaryVwap
+    PrimaryVwap.session => "Session"
+    PrimaryVwap.daily   => "Daily"
+    PrimaryVwap.weekly  => "Weekly"
+    PrimaryVwap.monthly => "Monthly"
+    PrimaryVwap.anchor1 => "Anchored #1"
+    PrimaryVwap.anchor2 => "Anchored #2"
+    => "Session"
+
+//@variable Why the primary VWAP has no data, when it has none.
+string primaryStatus = switch primaryVwap
+    PrimaryVwap.anchor1 => useAnchored1 ? anc1Status : "Anchored #1 is off"
+    PrimaryVwap.anchor2 => useAnchored2 ? anc2Status : "Anchored #2 is off"
+    => volumeValid ? "warming up" : "no volume data"
+
+// FACT values gated by Confirm-on-bar-close before they reach the score.
+float valuePosHeld = hold(valuePos)
+float vwapZHeld    = hold(vwapZ)
 
 buildComponents() =>
     array<Component> c = array.new<Component>()
@@ -1001,12 +1346,12 @@ buildComponents() =>
 
     // --- Volume Profile: live as of P1 ---
     Component vp = Component.new(name = "Volume Prof.", weight = wVp, enabled = enVp)
-    if not na(valuePos)
+    if not na(valuePosHeld)
         vp.valid  := true
-        vp.raw    := clamp(valuePos, -1.0, 1.0)
+        vp.raw    := clamp(valuePosHeld, -1.0, 1.0)
         vp.state  := valueState
         vp.approx := resolvedSource == "FOOTPRINT"
-        vp.reason := (useTpoSrc ? "TPO" : "volume") + " profile · POC " +
+        vp.reason := (useTpoSrc ? "TPO" : "volume") + " profile, POC " +
              str.tostring(curProf.poc, format.mintick)
     else
         vp.state  := "-"
@@ -1015,8 +1360,20 @@ buildComponents() =>
 
     c.push(Component.new(name = "Structure", weight = wStruct, enabled = enStruct,
          state = "-", reason = "engine arrives in P5"))
-    c.push(Component.new(name = "VWAP", weight = wVwap, enabled = enVwap,
-         state = "-", reason = "engine arrives in P3"))
+
+    // --- VWAP: live as of P3 ---
+    Component vw = Component.new(name = "VWAP", weight = wVwap, enabled = enVwap)
+    if not na(vwapZHeld)
+        vw.valid  := true
+        vw.raw    := clamp(vwapZHeld / zSaturation, -1.0, 1.0)
+        vw.state  := vwapPos + " " + str.tostring(vwapZHeld, "0.0") + " sigma"
+        vw.reason := primaryName + " VWAP " + str.tostring(vwapVal, format.mintick) + ", " + vwapZone
+    else
+        vw.state  := "-"
+        // NO DATA != NEUTRAL: say which of the several reasons applies.
+        vw.reason := not volumeValid ? "no volume data (VWAP undefined)" : primaryStatus
+    c.push(vw)
+
     c.push(Component.new(name = "Liquidity", weight = wLiq, enabled = enLiq,
          state = "-", reason = "engine arrives in P6"))
     c.push(Component.new(name = "Imbalance", weight = wImb, enabled = enImb,
@@ -1094,7 +1451,7 @@ var array<float> prevContrib = array.new<float>(7, 0.0)
 //  13. DASHBOARD
 // ============================================================================
 
-var table dash = table.new(dashPosStr, 5, 24, bgcolor = cPanel,
+var table dash = table.new(dashPosStr, 5, 26, bgcolor = cPanel,
      border_color = cBorder, border_width = 1, frame_color = cBorder, frame_width = 1)
 
 //@function Writes one dashboard cell.
@@ -1103,7 +1460,7 @@ dcell(int col, int row, string txt, color txtColor, string align) =>
          text_halign = align, bgcolor = color.new(color.black, 100))
 
 renderDashboard() =>
-    table.clear(dash, 0, 0, 4, 23)
+    table.clear(dash, 0, 0, 4, 25)
     int r = 0
 
     // ---- header
@@ -1173,6 +1530,14 @@ renderDashboard() =>
     dcell(4, r, "ATR " + fmt(atr, format.mintick), cMuted, text.align_right)
     r += 1
 
+    dcell(0, r, "VWAP", cMuted, text.align_left)
+    dcell(1, r, vwapValid ? primaryName + " " + str.tostring(vwapVal, format.mintick) : "-",
+         vwapValid ? cText : cMuted, text.align_left)
+    dcell(2, r, "σ", cMuted, text.align_right)
+    dcell(3, r, fmt(vwapSd, format.mintick), cText, text.align_right)
+    dcell(4, r, vwapZone, cMuted, text.align_right)
+    r += 1
+
     dcell(0, r, "VALUE", cMuted, text.align_left)
     dcell(1, r, valueState, na(valuePos) ? cMuted : valuePos > 0 ? cBull : valuePos < 0 ? cBear : cText, text.align_left)
     dcell(2, r, "DEV POC", cMuted, text.align_right)
@@ -1208,7 +1573,7 @@ renderDashboard() =>
 //  14. DEBUG FRAMEWORK
 // ============================================================================
 
-var table dbg = table.new(position.bottom_left, 3, 32, bgcolor = cPanel,
+var table dbg = table.new(position.bottom_left, 3, 40, bgcolor = cPanel,
      border_color = cBorder, border_width = 1, frame_color = cBorder, frame_width = 1)
 
 dbgRow(int row, string k, string v, color vc) =>
@@ -1222,7 +1587,7 @@ dbgEngineRow(int row, EngineState e) =>
     table.cell(dbg, 2, row, e.phase + " · " + e.summary, cMuted, text_size = size.tiny, text_halign = text.align_left)
 
 renderDebug() =>
-    table.clear(dbg, 0, 0, 2, 31)
+    table.clear(dbg, 0, 0, 2, 39)
     int r = 0
     table.cell(dbg, 0, r, "ACE DEBUG", cText, text_size = size.tiny, text_halign = text.align_left)
     table.cell(dbg, 1, r, ACE_VERSION, cAccent, text_size = size.tiny, text_halign = text.align_left)
@@ -1271,6 +1636,21 @@ renderDebug() =>
         dbgRow(r, "prof bars", str.tostring(bar_index - curProf.startBar + 1), cText)
         r += 1
         dbgRow(r, "value pos", fmt(valuePos, "0.000"), cText)
+        r += 1
+        dbgRow(r, "vwap primary", primaryName + " " + fmt(vwapVal, format.mintick), vwapValid ? cText : cWarn)
+        r += 1
+        dbgRow(r, "vwap sigma", fmt(vwapSd, format.mintick), cText)
+        r += 1
+        dbgRow(r, "vwap z", fmt(vwapZ, "0.000"), cText)
+        r += 1
+        dbgRow(r, "session vwap", fmt(accSession.vwap, format.mintick), cText)
+        r += 1
+        dbgRow(r, "ta.vwap ref", fmt(refVwap, format.mintick), cText)
+        r += 1
+        dbgRow(r, "diff (ticks)", fmt(vwapDiffTicks, "0.0000"),
+             na(vwapDiffTicks) ? cMuted : vwapDiffTicks < 0.5 ? cBull : cWarn)
+        r += 1
+        dbgRow(r, "anchored #1/#2", anc1Status + " / " + anc2Status, cText)
         r += 1
 
     if dbgEngines
@@ -1410,11 +1790,11 @@ if barstate.islast
     if showDash
         renderDashboard()
     else
-        table.clear(dash, 0, 0, 4, 23)
+        table.clear(dash, 0, 0, 4, 25)
     if dbgOn
         renderDebug()
     else
-        table.clear(dbg, 0, 0, 2, 31)
+        table.clear(dbg, 0, 0, 2, 39)
 
 // Keeps the pane scale stable and gives the script a plot to hang alerts on
 // in later phases. Invisible by design.
@@ -1423,5 +1803,26 @@ if barstate.islast
 plot(devEnabled and showDevPoc ? devPoc : na, "Developing POC", cAccent, 1, plot.style_linebr)
 plot(devEnabled and showDevPoc ? devVah : na, "Developing VAH", color.new(cBull, 40), 1, plot.style_linebr)
 plot(devEnabled and showDevPoc ? devVal : na, "Developing VAL", color.new(cBear, 40), 1, plot.style_linebr)
+
+// ---- VWAP plots ------------------------------------------------------------
+// Plotted live: a VWAP moving inside the forming bar is normal behaviour, not
+// repainting. Closed-bar values never change.
+bool vwOn = showFacts and volumeValid
+
+plot(vwOn and useSessionVwap and accSession.valid ? accSession.vwap : na, "Session VWAP", cAccent, 2)
+plot(vwOn and useDailyVwap   and accDaily.valid   ? accDaily.vwap   : na, "Daily VWAP",   #42a5f5, 1)
+plot(vwOn and useWeeklyVwap  and accWeekly.valid  ? accWeekly.vwap  : na, "Weekly VWAP",  #ab47bc, 1)
+plot(vwOn and useMonthlyVwap and accMonthly.valid ? accMonthly.vwap : na, "Monthly VWAP", #8d6e63, 1)
+plot(vwOn and useAnchored1 and accAnc1.valid ? accAnc1.vwap : na, "Anchored VWAP 1", #26c6da, 1)
+plot(vwOn and useAnchored2 and accAnc2.valid ? accAnc2.vwap : na, "Anchored VWAP 2", #ffa726, 1)
+
+bool bandsOn = vwOn and showVwapBands
+pU1 = plot(bandsOn ? bandU1 : na, "VWAP +1σ", color.new(cBull, 45), 1)
+pL1 = plot(bandsOn ? bandL1 : na, "VWAP -1σ", color.new(cBear, 45), 1)
+plot(bandsOn ? bandU2 : na, "VWAP +2σ", color.new(cBull, 65), 1)
+plot(bandsOn ? bandL2 : na, "VWAP -2σ", color.new(cBear, 65), 1)
+plot(bandsOn ? bandU3 : na, "VWAP +3σ", color.new(cBull, 80), 1)
+plot(bandsOn ? bandL3 : na, "VWAP -3σ", color.new(cBear, 80), 1)
+fill(pU1, pL1, showVwapFill and bandsOn ? color.new(cAccent, 93) : na, title = "VWAP band fill")
 
 plot(close, "ACE anchor", display = display.none, editable = false)
