@@ -2865,6 +2865,27 @@ if barstate.isconfirmed
     prevBias := score.bias
 
 // ============================================================================
+//  12c. DRAWING BUDGET                                                    [P6]
+//  Boxes are a shared, hard-capped resource (500). The profile histograms and
+//  the FVG zones both draw boxes, so the split is decided here, once, instead
+//  of each renderer assuming it owns the whole budget. When a histogram does
+//  not fit it is hidden and the dashboard says so - silently drawing a partial
+//  profile would be worse than drawing none.
+// ============================================================================
+
+const int BOX_LIMIT = 500
+const int BOX_RESERVE = 24          // headroom (incl. the AMT balance box)
+
+int fvgBoxBudget = showFvg ? resolvedMaxZones : 0
+int profBoxBudget = math.max(0, BOX_LIMIT - BOX_RESERVE - fvgBoxBudget)
+bool prevHistoWanted = showHisto and showPrevProfile and resolvedProfiles > 1 and prvProf.bins > 0
+int curBoxBudget = prevHistoWanted ? int(profBoxBudget * 0.6) : profBoxBudget
+int prvBoxBudget = profBoxBudget - curBoxBudget
+bool curHistoFits = curProf.bins > 0 and curProf.bins <= curBoxBudget
+bool prvHistoFits = prvProf.bins > 0 and prvProf.bins <= prvBoxBudget
+bool histoBudgetHit = showHisto and (not curHistoFits or (prevHistoWanted and not prvHistoFits))
+
+// ============================================================================
 //  13. DASHBOARD
 // ============================================================================
 
@@ -3069,16 +3090,16 @@ dbgRow(int row, string k, string v, color vc) =>
 
 dbgEngineRow(int row, EngineState e) =>
     table.cell(dbg, 0, row, e.name, text_color = cMuted, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(dbg, 1, row, e.ready ? "READY" : "PENDING", e.ready ? cBull : cWarn,
+    table.cell(dbg, 1, row, e.ready ? "READY" : "PENDING", text_color = e.ready ? cBull : cWarn,
          text_size = size.tiny, text_halign = text.align_left)
-    table.cell(dbg, 2, row, e.phase + " · " + e.summary, cMuted, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(dbg, 2, row, e.phase + " · " + e.summary, text_color = cMuted, text_size = size.tiny, text_halign = text.align_left)
 
 renderDebug() =>
     table.clear(dbg, 0, 0, 2, 99)
     int r = 0
-    table.cell(dbg, 0, r, "ACE DEBUG", cText, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(dbg, 1, r, ACE_VERSION, cAccent, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(dbg, 2, r, ACE_PHASE, cMuted, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(dbg, 0, r, "ACE DEBUG", text_color = cText, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(dbg, 1, r, ACE_VERSION, text_color = cAccent, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(dbg, 2, r, ACE_PHASE, text_color = cMuted, text_size = size.tiny, text_halign = text.align_left)
     r += 1
 
     if dbgRuntime
@@ -3252,27 +3273,6 @@ renderDebug() =>
         r += 1
         dbgEngineRow(r, engVol)
         r += 1
-
-// ============================================================================
-//  14a. DRAWING BUDGET                                                    [P6]
-//  Boxes are a shared, hard-capped resource (500). The profile histograms and
-//  the FVG zones both draw boxes, so the split is decided here, once, instead
-//  of each renderer assuming it owns the whole budget. When a histogram does
-//  not fit it is hidden and the dashboard says so - silently drawing a partial
-//  profile would be worse than drawing none.
-// ============================================================================
-
-const int BOX_LIMIT = 500
-const int BOX_RESERVE = 24          // headroom (incl. the AMT balance box)
-
-int fvgBoxBudget = showFvg ? resolvedMaxZones : 0
-int profBoxBudget = math.max(0, BOX_LIMIT - BOX_RESERVE - fvgBoxBudget)
-bool prevHistoWanted = showHisto and showPrevProfile and resolvedProfiles > 1 and prvProf.bins > 0
-int curBoxBudget = prevHistoWanted ? int(profBoxBudget * 0.6) : profBoxBudget
-int prvBoxBudget = profBoxBudget - curBoxBudget
-bool curHistoFits = curProf.bins > 0 and curProf.bins <= curBoxBudget
-bool prvHistoFits = prvProf.bins > 0 and prvProf.bins <= prvBoxBudget
-bool histoBudgetHit = showHisto and (not curHistoFits or (prevHistoWanted and not prvHistoFits))
 
 // ============================================================================
 //  14b. PROFILE RENDER                                                    [P1]

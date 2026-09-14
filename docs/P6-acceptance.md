@@ -130,7 +130,7 @@ took = isHigh ? (high > level and close < level)
 
 Лимит боксов — **500 жёстко**. Гистограммы профилей и зоны FVG рисуются боксами. При `bins = 300` для текущего и предыдущего профиля плюс 200 FVG получалось **≈ 800 боксов** — превышение лимита.
 
-Введён общий бюджет (секция `14a. DRAWING BUDGET`):
+Введён общий бюджет (секция `12c. DRAWING BUDGET`):
 ```
 BOX_LIMIT = 500, BOX_RESERVE = 20
 fvgBoxBudget  = showFvg ? maxZones : 0
