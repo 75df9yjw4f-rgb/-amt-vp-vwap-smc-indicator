@@ -1,0 +1,1 @@
+# -amt-vp-vwap-smc-indicator
