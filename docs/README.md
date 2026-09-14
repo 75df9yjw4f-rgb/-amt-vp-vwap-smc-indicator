@@ -22,13 +22,15 @@ Volume Profile, VWAP и базовый Market Structure / SMC в **единый 
 | `P1-acceptance.md` | Отчёт и критерии приёмки фазы P1 + протокол сравнения с нативным VP |
 | `P3-acceptance.md` | Отчёт и критерии приёмки фазы P3 (VWAP) |
 | `P5-acceptance.md` | Отчёт и критерии приёмки фазы P5 (Structure) + pivot-lag и repaint-аудит |
+| `P6-acceptance.md` | Отчёт и критерии приёмки фазы P6 (Liquidity + Imbalance) + performance-аудит |
 
 ## Статус
 
-✅ **P0** каркас · ✅ **P1** Profile · ✅ **P3** VWAP · ✅ **P5** Structure (v0.4.0-P5).
-⏳ Ожидается подтверждение перед **P6 (Liquidity + Imbalance)**.
+✅ **P0** каркас · ✅ **P1** Profile · ✅ **P3** VWAP · ✅ **P5** Structure ·
+✅ **P6** Liquidity + Imbalance (v0.5.0-P6).
+⏳ Ожидается подтверждение перед **P7 (Volume / Order Flow + LTF + footprint)**.
 
-Активных компонентов scoring: **3 из 7** (Volume Profile, VWAP, Structure).
+Активных компонентов scoring: **5 из 7** (Volume Profile, VWAP, Structure, Liquidity, Imbalance).
 Остальные честно показывают `NO DATA` с указанием причины, а не нейтральный ноль.
 
 ### Сборка (вариант B)

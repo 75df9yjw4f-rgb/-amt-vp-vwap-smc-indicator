@@ -62,8 +62,8 @@ indicator(
 // ============================================================================
 const string ACE_NAME    = "Auction Context Engine"
 const string ACE_SHORT   = "ACE"
-const string ACE_VERSION = "0.4.0-P5"
-const string ACE_PHASE   = "P5 - structure engine"
+const string ACE_VERSION = "0.5.0-P6"
+const string ACE_PHASE   = "P6 - liquidity + imbalance"
 const string ACE_BUILD   = "STD"   // rewritten to "STD" by tools/build.py
 
 // ============================================================================
@@ -114,6 +114,12 @@ enum BalanceMode
 enum BreakMode
     closeBreak = "Close through level"
     wickBreak  = "Wick through level"
+
+//@enum When a Fair Value Gap counts as mitigated (closed).
+enum FvgMitRule
+    touch = "Touch (any entry)"
+    half  = "50% (consequent encroachment)"
+    full  = "Full fill"
 
 //@enum Order block rule set. Convention-dependent by nature.
 enum ObRule
@@ -417,6 +423,8 @@ bool showEqual = input.bool(true, "Equal Highs / Lows", group = G_LIQ)
 float eqTol = input.float(0.10, "Equal tolerance (x ATR)", minval = 0.01, maxval = 1.0, step = 0.01, group = G_LIQ)
 int eqMaxGap = input.int(50, "Max bars between equal points", minval = 2, group = G_LIQ)
 bool showPools = input.bool(true, "Liquidity pools", group = G_LIQ)
+int maxLiqLevels = input.int(30, "Max liquidity levels kept", minval = 4, maxval = 100, group = G_LIQ)
+bool showLiqLabels = input.bool(true, "Label EQH / EQL and sweeps", group = G_LIQ)
 bool showSweeps = input.bool(true, "Sweeps", group = G_LIQ)
 bool sweepNeedsChoch = input.bool(false, "Sweep requires following CHoCH", group = G_LIQ,
      tooltip = "Far fewer false positives, at the cost of a delay of up to N bars.")
@@ -425,12 +433,18 @@ int sweepConfirmBars = input.int(5, "Sweep confirmation window (bars)", minval =
 // ---- IMBALANCE -------------------------------------------------------------
 bool showFvg = input.bool(true, "Fair Value Gaps", group = G_IMB)
 float minFvgAtr = input.float(0.15, "Min FVG size (x ATR)", minval = 0.0, step = 0.05, group = G_IMB)
+FvgMitRule fvgMitRule = input.enum(FvgMitRule.full, "FVG mitigation rule", group = G_IMB,
+     tooltip = "When a gap stops being tracked. Touch is the strictest reading " +
+               "(any entry consumes it), Full is the loosest. This choice changes " +
+               "how many gaps stay active, and therefore the Imbalance score.")
 bool hideMitigated = input.bool(true, "Hide fully mitigated zones", group = G_IMB)
 bool showDisp = input.bool(true, "Displacement", group = G_IMB)
 float dispBodyAtr = input.float(1.5, "Displacement body (x ATR)", minval = 0.1, step = 0.1, group = G_IMB)
 bool dispNeedsFvg = input.bool(true, "Displacement must create an FVG", group = G_IMB)
-bool showOb = input.bool(true, "Order Blocks", group = G_IMB,
-     tooltip = "CONVENTION-DEPENDENT. Competing definitions exist; the rule you pick " +
+bool showOb = input.bool(false, "Order Blocks (not implemented yet)", group = G_IMB,
+     tooltip = "NOT IMPLEMENTED AS OF P6 - this switch currently does nothing, and " +
+               "the debug panel says so. When it does arrive it will be " +
+               "CONVENTION-DEPENDENT. Competing definitions exist; the rule you pick " +
                "below changes the result. Order blocks are also drawn on a past candle " +
                "after the break confirms them (backpainting) - they were not knowable " +
                "at that candle's close.")
@@ -680,6 +694,40 @@ var EngineState engImb     = EngineState.new("Imbalance", false, "P6", "not impl
 var EngineState engVol     = EngineState.new("Volume",    false, "P7", "not implemented")
 
 // ============================================================================
+//  9b. IMBALANCE PRIMITIVES                                               [P6]
+// ----------------------------------------------------------------------------
+//  FVG detection is pure OHLC arithmetic on a 3-bar window that ENDS on the
+//  current bar, so it is computed here, ahead of the Structure Engine, which
+//  needs it for the optional "displacement must create an FVG" condition.
+//
+//  CONVENTION NOTE - which bar of the triple is the displacement bar
+//  Many descriptions place the big candle in the MIDDLE of the triple. Testing
+//  that at bar t would require bar t+1, i.e. future data, so we do not do it.
+//  Here the displacement bar is the LAST bar of the triple: the gap between
+//  high[2] and low[0] is already complete at the current close. This is
+//  detectable in real time and is what the code actually implements.
+// ============================================================================
+
+//@variable Raw 3-bar gap conditions. Confirmed at the close of the third bar.
+bool fvgUpRaw = low > high[2]
+bool fvgDnRaw = high < low[2]
+
+float fvgUpBot = high[2]
+float fvgUpTop = low
+float fvgDnBot = high
+float fvgDnTop = low[2]
+
+float fvgUpSize = fvgUpRaw ? fvgUpTop - fvgUpBot : na
+float fvgDnSize = fvgDnRaw ? fvgDnTop - fvgDnBot : na
+
+//@variable Minimum gap height for a gap to be tracked at all.
+float fvgMinSize = nz(atr) * minFvgAtr
+
+bool fvgUpNew = fvgUpRaw and fvgUpSize >= fvgMinSize and fvgUpSize > 0
+bool fvgDnNew = fvgDnRaw and fvgDnSize >= fvgMinSize and fvgDnSize > 0
+bool fvgAnyNew = fvgUpNew or fvgDnNew
+
+// ============================================================================
 //  10a. STRUCTURE ENGINE                                                  [P5]
 // ----------------------------------------------------------------------------
 //  PIVOT LAG - the single most important honesty point in this engine
@@ -802,9 +850,11 @@ if not na(plRaw)
 bool structBarOk = confirmClose ? barstate.isconfirmed : true
 
 //@variable Displacement on the breaking bar, used to separate MSS from CHoCH.
-//          P5 uses the body-vs-ATR test only; the optional "must create an FVG"
-//          condition becomes active in P6, when FVGs exist.
-bool dispNow = not na(atr) and atr > 0 and math.abs(close - open) >= dispBodyAtr * atr
+//          The optional "must create an FVG" condition is active as of P6 and
+//          uses the gap that completes on THIS bar (see 9b for why the middle
+//          bar convention is not used).
+bool dispBody = not na(atr) and atr > 0 and math.abs(close - open) >= dispBodyAtr * atr
+bool dispNow = dispBody and (not dispNeedsFvg or fvgAnyNew)
 
 float brkU = breakMode == BreakMode.closeBreak ? close : high
 float brkD = breakMode == BreakMode.closeBreak ? close : low
@@ -1514,6 +1564,309 @@ else
     engVwap.summary := volumeValid ? "warming up" : "no volume data"
 
 // ============================================================================
+//  10d. IMBALANCE ENGINE                                                  [P6]
+// ----------------------------------------------------------------------------
+//  Tracks Fair Value Gaps and how far price has since traded back into them.
+//
+//  FACT ONLY: a gap has a direction because the gap itself points up or down -
+//  that is geometry, not opinion. The engine reports where each gap is, how
+//  large it was, and what fraction of it has been filled. It does not claim a
+//  bullish gap is a reason to buy.
+// ============================================================================
+
+const int KIND_FVG = 0
+const int KIND_OB  = 1
+const int KIND_LIQ = 2
+
+//@function Adds a zone, evicting fully mitigated ones before live ones.
+pushZone(array<Zone> zs, Zone z, int cap) =>
+    array.push(zs, z)
+    while array.size(zs) > cap
+        int victim = 0
+        for i = 0 to array.size(zs) - 1
+            if not array.get(zs, i).active
+                victim := i
+                break
+        array.remove(zs, victim)
+
+//@function Fraction of a zone that price has traded through, 0..1.
+zoneFill(Zone z, float h, float l) =>
+    float span = z.top - z.bot
+    float f = 0.0
+    if span > 0
+        if z.bull
+            // A bullish gap is filled from above.
+            f := (z.top - math.min(l, z.top)) / span
+        else
+            // A bearish gap is filled from below.
+            f := (math.max(h, z.bot) - z.bot) / span
+    clamp(f, 0.0, 1.0)
+
+//@function Is the zone considered closed under the selected rule?
+zoneClosed(float mit, FvgMitRule rule) =>
+    rule == FvgMitRule.touch ? mit > 0.0 : rule == FvgMitRule.half ? mit >= 0.5 : mit >= 1.0
+
+// Update mitigation on every tracked zone before adding this bar's new ones,
+// so a gap created now is not immediately "filled" by the bar that made it.
+if array.size(zones) > 0
+    for i = 0 to array.size(zones) - 1
+        Zone z = array.get(zones, i)
+        if z.active and z.startBar < bar_index
+            float f = zoneFill(z, high, low)
+            if f > z.mitigated
+                z.mitigated := f
+            if zoneClosed(z.mitigated, fvgMitRule)
+                z.active := false
+
+if showFvg and fvgUpNew
+    pushZone(zones, Zone.new(top = fvgUpTop, bot = fvgUpBot, startBar = bar_index - 2,
+         bull = true, kind = KIND_FVG), resolvedMaxZones)
+if showFvg and fvgDnNew
+    pushZone(zones, Zone.new(top = fvgDnTop, bot = fvgDnBot, startBar = bar_index - 2,
+         bull = false, kind = KIND_FVG), resolvedMaxZones)
+
+// ---- nearest unmitigated gaps, as a measurement ----------------------------
+
+float imbUpScore = 0.0
+float imbDnScore = 0.0
+float imbUpDist = na
+float imbDnDist = na
+int   imbActive = 0
+
+if array.size(zones) > 0 and not na(atr) and atr > 0
+    for i = 0 to array.size(zones) - 1
+        Zone z = array.get(zones, i)
+        if z.active
+            imbActive += 1
+            float rest = 1.0 - z.mitigated
+            if z.bull and z.top <= close
+                // Unfilled bullish gap resting below price.
+                float d = close - z.top
+                float sc = rest * math.exp(-d / (2.0 * atr))
+                if sc > imbUpScore
+                    imbUpScore := sc
+                    imbUpDist  := d
+            else if not z.bull and z.bot >= close
+                float d = z.bot - close
+                float sc = rest * math.exp(-d / (2.0 * atr))
+                if sc > imbDnScore
+                    imbDnScore := sc
+                    imbDnDist  := d
+
+//@variable Does the engine have anything to report at all? Distinguishes
+//          "no gaps tracked" (NO DATA) from "gaps tracked, none near price"
+//          (a genuine neutral zero). The signed combination of the two
+//          magnitudes above is deliberately NOT done here - see INVARIANT #1.
+bool imbHasData = imbActive > 0
+
+string imbState = imbActive == 0 ? "-" :
+     na(imbUpDist) and na(imbDnDist) ? "no gap near price" :
+     imbUpScore >= imbDnScore ? "gap below, " + str.tostring(nz(imbUpDist) / atr, "0.0") + " ATR" :
+     "gap above, " + str.tostring(nz(imbDnDist) / atr, "0.0") + " ATR"
+
+engImb.ready := imbActive > 0
+if imbActive > 0
+    engImb.summary := str.tostring(imbActive) + " active / " + str.tostring(array.size(zones)) + " tracked"
+else
+    engImb.summary := showFvg ? "no active FVG" : "FVG display off"
+
+// ============================================================================
+//  10e. LIQUIDITY ENGINE                                                   [P6]
+// ----------------------------------------------------------------------------
+//  Liquidity levels are prices where resting orders plausibly sit: repeated
+//  swing highs/lows (equal highs/lows) and prior period extremes.
+//
+//  "Buy-side" and "sell-side" here are POSITIONAL terms, not directional
+//  opinions: buy-side liquidity rests ABOVE price (stops of shorts, breakout
+//  buys), sell-side rests BELOW it. Saying that a sell-side sweep occurred is
+//  a statement of fact about where price traded. What it implies is decided by
+//  the Context Engine, not here.
+//
+//  NO FUTURE DATA IN SWEEP DETECTION
+//  The base rule uses only the current bar: price traded through the level and
+//  closed back on the original side. The optional "requires following CHoCH"
+//  mode does NOT look ahead - the sweep is held as PENDING and is confirmed
+//  later, on the bar where the structure event actually happens. It can also
+//  expire unconfirmed. Nothing is ever back-dated into a bar that had not
+//  closed yet.
+// ============================================================================
+
+var array<float> liqPrice   = array.new<float>()
+var array<int>   liqBar     = array.new<int>()
+var array<int>   liqTouch   = array.new<int>()
+var array<bool>  liqIsHigh  = array.new<bool>()
+var array<bool>  liqSwept   = array.new<bool>()
+
+//@function Registers a swing level, merging it into an existing level when the
+//          two are within tolerance. A merged level is an Equal High / Low.
+addLiqLevel(float price, int bar, bool isHigh, float tol, int maxGap, int cap) =>
+    int hit = -1
+    if array.size(liqPrice) > 0
+        for i = 0 to array.size(liqPrice) - 1
+            if array.get(liqIsHigh, i) == isHigh and not array.get(liqSwept, i)
+                if math.abs(array.get(liqPrice, i) - price) <= tol and bar - array.get(liqBar, i) <= maxGap
+                    hit := i
+                    break
+    if hit >= 0
+        // Equal high / low: average the touches and count them.
+        int t = array.get(liqTouch, hit) + 1
+        array.set(liqPrice, hit, (array.get(liqPrice, hit) * (t - 1) + price) / t)
+        array.set(liqTouch, hit, t)
+        array.set(liqBar, hit, bar)
+    else
+        array.push(liqPrice, price)
+        array.push(liqBar, bar)
+        array.push(liqTouch, 1)
+        array.push(liqIsHigh, isHigh)
+        array.push(liqSwept, false)
+        while array.size(liqPrice) > cap
+            array.shift(liqPrice)
+            array.shift(liqBar)
+            array.shift(liqTouch)
+            array.shift(liqIsHigh)
+            array.shift(liqSwept)
+
+float eqTolPrice = nz(atr) * eqTol
+
+if showEqual or showPools
+    if not na(phRaw)
+        addLiqLevel(phRaw, bar_index - swingLen, true, eqTolPrice, eqMaxGap, maxLiqLevels)
+    if not na(plRaw)
+        addLiqLevel(plRaw, bar_index - swingLen, false, eqTolPrice, eqMaxGap, maxLiqLevels)
+
+// ---- prior period extremes -------------------------------------------------
+var float curDayHi = na
+var float curDayLo = na
+var float prevDayHi = na
+var float prevDayLo = na
+if isNewDay
+    prevDayHi := curDayHi
+    prevDayLo := curDayLo
+    curDayHi  := high
+    curDayLo  := low
+else
+    curDayHi := math.max(nz(curDayHi, high), high)
+    curDayLo := math.min(nz(curDayLo, low), low)
+
+// ---- sweep detection -------------------------------------------------------
+
+var int   sweepPendBar   = na
+var int   sweepPendSide  = 0        // +1 buy-side taken, -1 sell-side taken
+var float sweepPendLevel = na
+
+var int   lastSweepBar   = na
+var int   lastSweepSide  = 0
+var float lastSweepLevel = na
+var bool  lastSweepConf  = false
+
+//@variable Gate so sweeps cannot flicker inside an unconfirmed bar.
+bool liqBarOk = confirmClose ? barstate.isconfirmed : true
+
+int    sweepSideNow  = 0
+float  sweepLevelNow = na
+
+if showSweeps and liqBarOk and array.size(liqPrice) > 0
+    for i = 0 to array.size(liqPrice) - 1
+        if not array.get(liqSwept, i)
+            float lv = array.get(liqPrice, i)
+            bool isHi = array.get(liqIsHigh, i)
+            // Only the current bar is inspected: traded through, closed back.
+            bool took = isHi ? (high > lv and close < lv) : (low < lv and close > lv)
+            if took
+                array.set(liqSwept, i, true)
+                if sweepSideNow == 0
+                    sweepSideNow  := isHi ? 1 : -1
+                    sweepLevelNow := lv
+
+// Prior-day extremes are swept the same way, without entering the level list.
+if showSweeps and liqBarOk and sweepSideNow == 0
+    if not na(prevDayHi) and high > prevDayHi and close < prevDayHi
+        sweepSideNow  := 1
+        sweepLevelNow := prevDayHi
+    else if not na(prevDayLo) and low < prevDayLo and close > prevDayLo
+        sweepSideNow  := -1
+        sweepLevelNow := prevDayLo
+
+if sweepSideNow != 0
+    if sweepNeedsChoch
+        // Held as pending. Confirmation happens on a LATER bar, never by
+        // reaching forward from this one.
+        sweepPendBar   := bar_index
+        sweepPendSide  := sweepSideNow
+        sweepPendLevel := sweepLevelNow
+    else
+        lastSweepBar   := bar_index
+        lastSweepSide  := sweepSideNow
+        lastSweepLevel := sweepLevelNow
+        lastSweepConf  := true
+
+// Pending sweeps are resolved here, on the bar where the structure event
+// actually occurs, or dropped when the window expires.
+if not na(sweepPendBar)
+    bool expired = bar_index - sweepPendBar > sweepConfirmBars
+    bool confirmedNow = takeDir != 0 and takeDir == -sweepPendSide
+    if confirmedNow
+        lastSweepBar   := sweepPendBar
+        lastSweepSide  := sweepPendSide
+        lastSweepLevel := sweepPendLevel
+        lastSweepConf  := true
+        sweepPendBar   := na
+        sweepPendSide  := 0
+        sweepPendLevel := na
+    else if expired
+        sweepPendBar   := na
+        sweepPendSide  := 0
+        sweepPendLevel := na
+
+// ---- liquidity measurement -------------------------------------------------
+
+int eqHighCount = 0
+int eqLowCount = 0
+float nearestAbove = na
+float nearestBelow = na
+if array.size(liqPrice) > 0
+    for i = 0 to array.size(liqPrice) - 1
+        if not array.get(liqSwept, i)
+            float lv = array.get(liqPrice, i)
+            bool isHi = array.get(liqIsHigh, i)
+            if array.get(liqTouch, i) >= 2
+                if isHi
+                    eqHighCount += 1
+                else
+                    eqLowCount += 1
+            if lv > close and (na(nearestAbove) or lv < nearestAbove)
+                nearestAbove := lv
+            if lv < close and (na(nearestBelow) or lv > nearestBelow)
+                nearestBelow := lv
+
+//@variable Age-decayed strength of the most recent confirmed sweep.
+float sweepStrength = na
+if not na(lastSweepBar) and lastSweepConf
+    sweepStrength := decayFactor(bar_index - lastSweepBar, decayHalfLife)
+
+//@variable Proximity of the nearest unswept pool on each side, 0..1.
+//          Magnitudes only: which side of the score they belong on is decided
+//          by the Context Engine, not here.
+float poolAboveProx = na(nearestAbove) or na(atr) or atr <= 0 ? 0.0 : math.exp(-(nearestAbove - close) / (2.0 * atr))
+float poolBelowProx = na(nearestBelow) or na(atr) or atr <= 0 ? 0.0 : math.exp(-(close - nearestBelow) / (2.0 * atr))
+
+bool liqHasData = not na(sweepStrength) or array.size(liqPrice) > 0
+
+string liqState = "-"
+if not na(sweepStrength)
+    // Positional fact: which side's resting liquidity was traded through.
+    liqState := (lastSweepSide > 0 ? "Buy-side swept" : "Sell-side swept") + " " +
+         str.tostring(bar_index - lastSweepBar) + "b"
+else if array.size(liqPrice) > 0
+    liqState := "Pools: " + str.tostring(eqHighCount) + " EQH / " + str.tostring(eqLowCount) + " EQL"
+
+engLiq.ready := liqHasData
+if liqHasData
+    engLiq.summary := liqState + ", levels " + str.tostring(array.size(liqPrice))
+else
+    engLiq.summary := showEqual or showPools ? "no levels yet" : "liquidity display off"
+
+// ============================================================================
 //  11. CONTEXT ENGINE
 //      Turns engine FACTS into normalised component scores in [-1, +1].
 //      A component with no data reports valid = false and is excluded from the
@@ -1540,6 +1893,28 @@ string primaryStatus = switch primaryVwap
 float valuePosHeld  = hold(valuePos)
 float vwapZHeld     = hold(vwapZ)
 float structRawHeld = hold(structRaw)
+// INTERPRETATION starts here. The engines above reported only magnitudes and
+// which side of the market they belong to; the sign conventions below are this
+// layer's choice, and they are the part a user might reasonably disagree with.
+//
+//   Liquidity: a sweep of SELL-side liquidity (below price) scores positive,
+//   a sweep of BUY-side scores negative; an unswept pool scores weakly toward
+//   the side it sits on, because price tends to be drawn to it.
+//
+//   Imbalance: an unfilled gap below price scores positive, one above scores
+//   negative - the support/resistance reading. The opposite convention (an
+//   unfilled gap is a magnet, so it scores toward itself) is equally defensible
+//   and is noted in the docs rather than silently dismissed.
+float liqComposed = na
+if not na(sweepStrength)
+    liqComposed := clamp(-lastSweepSide * sweepStrength, -1.0, 1.0)
+else if liqHasData
+    liqComposed := clamp(0.2 * (poolBelowProx - poolAboveProx), -1.0, 1.0)
+
+float imbComposed = imbHasData ? clamp(imbUpScore - imbDnScore, -1.0, 1.0) : na
+
+float liqRawHeld    = hold(liqComposed)
+float imbRawHeld    = hold(imbComposed)
 
 buildComponents() =>
     array<Component> c = array.new<Component>()
@@ -1588,10 +1963,32 @@ buildComponents() =>
         vw.reason := not volumeValid ? "no volume data (VWAP undefined)" : primaryStatus
     c.push(vw)
 
-    c.push(Component.new(name = "Liquidity", weight = wLiq, enabled = enLiq,
-         state = "-", reason = "engine arrives in P6"))
-    c.push(Component.new(name = "Imbalance", weight = wImb, enabled = enImb,
-         state = "-", reason = "engine arrives in P6"))
+    // --- Liquidity: live as of P6 ---
+    Component lq = Component.new(name = "Liquidity", weight = wLiq, enabled = enLiq)
+    if not na(liqRawHeld)
+        lq.valid  := true
+        lq.raw    := clamp(liqRawHeld, -1.0, 1.0)
+        lq.state  := liqState
+        lq.reason := na(lastSweepBar) ? "resting pools only, no sweep yet" :
+             "last sweep of " + str.tostring(lastSweepLevel, format.mintick) +
+             (sweepNeedsChoch ? " (CHoCH confirmed)" : "")
+    else
+        lq.state  := "-"
+        lq.reason := showEqual or showPools ? "no liquidity levels yet" : "liquidity detection off"
+    c.push(lq)
+
+    // --- Imbalance: live as of P6 ---
+    Component im = Component.new(name = "Imbalance", weight = wImb, enabled = enImb)
+    if not na(imbRawHeld)
+        im.valid  := true
+        im.raw    := clamp(imbRawHeld, -1.0, 1.0)
+        im.state  := imbState
+        im.reason := str.tostring(imbActive) + " active FVG, rule " + str.tostring(fvgMitRule)
+    else
+        im.state  := "-"
+        // No tracked gap is an absence of evidence, not a balanced market.
+        im.reason := showFvg ? "no active FVG" : "FVG detection off"
+    c.push(im)
     c.push(Component.new(name = "Volume", weight = wVol, enabled = enVol,
          state = "-", reason = "engine arrives in P7"))
     c
@@ -1665,7 +2062,7 @@ var array<float> prevContrib = array.new<float>(7, 0.0)
 //  13. DASHBOARD
 // ============================================================================
 
-var table dash = table.new(dashPosStr, 5, 28, bgcolor = cPanel,
+var table dash = table.new(dashPosStr, 5, 30, bgcolor = cPanel,
      border_color = cBorder, border_width = 1, frame_color = cBorder, frame_width = 1)
 
 //@function Writes one dashboard cell.
@@ -1674,7 +2071,7 @@ dcell(int col, int row, string txt, color txtColor, string align) =>
          text_halign = align, bgcolor = color.new(color.black, 100))
 
 renderDashboard() =>
-    table.clear(dash, 0, 0, 4, 27)
+    table.clear(dash, 0, 0, 4, 29)
     int r = 0
 
     // ---- header
@@ -1744,6 +2141,13 @@ renderDashboard() =>
     dcell(4, r, "ATR " + fmt(atr, format.mintick), cMuted, text.align_right)
     r += 1
 
+    dcell(0, r, "LIQUIDITY", cMuted, text.align_left)
+    dcell(1, r, liqState, liqHasData ? cText : cMuted, text.align_left)
+    dcell(2, r, "FVG", cMuted, text.align_right)
+    dcell(3, r, str.tostring(imbActive) + " active", imbActive > 0 ? cText : cMuted, text.align_right)
+    dcell(4, r, imbState, cMuted, text.align_right)
+    r += 1
+
     dcell(0, r, "STRUCTURE", cMuted, text.align_left)
     dcell(1, r, structDir == 0 ? "-" : structState, structDir == 0 ? cMuted : structDir > 0 ? cBull : cBear, text.align_left)
     dcell(2, r, "RANGE", cMuted, text.align_right)
@@ -1774,6 +2178,14 @@ renderDashboard() =>
     dcell(4, r, useTpoSrc ? "TPO" : "VOL", useTpoSrc ? cWarn : cMuted, text.align_right)
     r += 1
 
+    if histoBudgetHit
+        dcell(0, r, "NOTE", cWarn, text.align_left)
+        dcell(1, r, "Histogram hidden: bins exceed the box budget (" + str.tostring(curBoxBudget) + ")", cWarn, text.align_left)
+        dcell(2, r, "", cWarn, text.align_right)
+        dcell(3, r, "", cWarn, text.align_right)
+        dcell(4, r, "", cWarn, text.align_right)
+        r += 1
+
     if curProf.clamped
         dcell(0, r, "WARNING", cWarn, text.align_left)
         dcell(1, r, "Profile grid clamped - tails may be mis-binned", cWarn, text.align_left)
@@ -1794,7 +2206,7 @@ renderDashboard() =>
 //  14. DEBUG FRAMEWORK
 // ============================================================================
 
-var table dbg = table.new(position.bottom_left, 3, 52, bgcolor = cPanel,
+var table dbg = table.new(position.bottom_left, 3, 66, bgcolor = cPanel,
      border_color = cBorder, border_width = 1, frame_color = cBorder, frame_width = 1)
 
 dbgRow(int row, string k, string v, color vc) =>
@@ -1808,7 +2220,7 @@ dbgEngineRow(int row, EngineState e) =>
     table.cell(dbg, 2, row, e.phase + " · " + e.summary, cMuted, text_size = size.tiny, text_halign = text.align_left)
 
 renderDebug() =>
-    table.clear(dbg, 0, 0, 2, 51)
+    table.clear(dbg, 0, 0, 2, 65)
     int r = 0
     table.cell(dbg, 0, r, "ACE DEBUG", cText, text_size = size.tiny, text_halign = text.align_left)
     table.cell(dbg, 1, r, ACE_VERSION, cAccent, text_size = size.tiny, text_halign = text.align_left)
@@ -1889,7 +2301,27 @@ renderDebug() =>
         r += 1
         dbgRow(r, "premium/discount", pdState + " " + fmt(pdPos, "0.000"), cText)
         r += 1
-        dbgRow(r, "displacement", dispNow ? "yes (body-only, FVG gate in P6)" : "no (body-only, FVG gate in P6)", cMuted)
+        dbgRow(r, "displacement", (dispBody ? "body yes" : "body no") + (dispNeedsFvg ? (fvgAnyNew ? ", FVG yes" : ", FVG no") : ", FVG gate off"), cMuted)
+        r += 1
+        dbgRow(r, "box budget", "prof " + str.tostring(curBoxBudget) + "+" + str.tostring(prvBoxBudget) + ", fvg " + str.tostring(fvgBoxBudget) + (histoBudgetHit ? " OVER" : " ok"), histoBudgetHit ? cWarn : cText)
+        r += 1
+        dbgRow(r, "zones tracked", str.tostring(array.size(zones)) + " / " + str.tostring(resolvedMaxZones) + ", active " + str.tostring(imbActive), cText)
+        r += 1
+        dbgRow(r, "fvg new", (fvgUpNew ? "bull " : "") + (fvgDnNew ? "bear" : "") + (fvgUpNew or fvgDnNew ? "" : "none"), cText)
+        r += 1
+        dbgRow(r, "fvg min size", fmt(fvgMinSize, format.mintick) + " (" + str.tostring(minFvgAtr, "0.00") + " ATR)", cText)
+        r += 1
+        dbgRow(r, "liq levels", str.tostring(array.size(liqPrice)) + " / " + str.tostring(maxLiqLevels) + ", EQH " + str.tostring(eqHighCount) + " EQL " + str.tostring(eqLowCount), cText)
+        r += 1
+        dbgRow(r, "nearest pools", fmt(nearestBelow, format.mintick) + " < px < " + fmt(nearestAbove, format.mintick), cText)
+        r += 1
+        dbgRow(r, "sweep pending", na(sweepPendBar) ? "none" : (sweepPendSide > 0 ? "BSL" : "SSL") + " " + str.tostring(bar_index - sweepPendBar) + "/" + str.tostring(sweepConfirmBars) + "b", na(sweepPendBar) ? cMuted : cWarn)
+        r += 1
+        dbgRow(r, "sweep last", na(lastSweepBar) ? "none" : (lastSweepSide > 0 ? "BSL " : "SSL ") + fmt(lastSweepLevel, format.mintick) + " " + str.tostring(bar_index - lastSweepBar) + "b", cText)
+        r += 1
+        dbgRow(r, "prev day hi/lo", fmt(prevDayHi, format.mintick) + " / " + fmt(prevDayLo, format.mintick), cText)
+        r += 1
+        dbgRow(r, "order blocks", "not implemented (input is inert)", cWarn)
         r += 1
 
     if dbgEngines
@@ -1907,6 +2339,27 @@ renderDebug() =>
         r += 1
         dbgEngineRow(r, engVol)
         r += 1
+
+// ============================================================================
+//  14a. DRAWING BUDGET                                                    [P6]
+//  Boxes are a shared, hard-capped resource (500). The profile histograms and
+//  the FVG zones both draw boxes, so the split is decided here, once, instead
+//  of each renderer assuming it owns the whole budget. When a histogram does
+//  not fit it is hidden and the dashboard says so - silently drawing a partial
+//  profile would be worse than drawing none.
+// ============================================================================
+
+const int BOX_LIMIT = 500
+const int BOX_RESERVE = 20          // headroom so a limit error can never fire
+
+int fvgBoxBudget = showFvg ? resolvedMaxZones : 0
+int profBoxBudget = math.max(0, BOX_LIMIT - BOX_RESERVE - fvgBoxBudget)
+bool prevHistoWanted = showHisto and showPrevProfile and resolvedProfiles > 1 and prvProf.bins > 0
+int curBoxBudget = prevHistoWanted ? int(profBoxBudget * 0.6) : profBoxBudget
+int prvBoxBudget = profBoxBudget - curBoxBudget
+bool curHistoFits = curProf.bins > 0 and curProf.bins <= curBoxBudget
+bool prvHistoFits = prvProf.bins > 0 and prvProf.bins <= prvBoxBudget
+bool histoBudgetHit = showHisto and (not curHistoFits or (prevHistoWanted and not prvHistoFits))
 
 // ============================================================================
 //  14b. PROFILE RENDER                                                    [P1]
@@ -1984,7 +2437,7 @@ renderProfiles() =>
         syncLines(lvlLines, 0)
     else
         // Current period.
-        if showHisto and curProf.bins > 0 and curProf.bins <= 300
+        if showHisto and curHistoFits
             int span = math.max(1, bar_index - curProf.startBar)
             int w = math.max(2, int(math.round(span * histoWidthPct / 100.0)))
             renderHisto(curProf, curBoxes, useTpoSrc, curProf.startBar, w, 70)
@@ -1992,7 +2445,7 @@ renderProfiles() =>
             syncBoxes(curBoxes, 0)
 
         // Previous period.
-        bool prevOn = showHisto and showPrevProfile and resolvedProfiles > 1 and prvProf.bins > 0 and prvProf.bins <= 300
+        bool prevOn = prevHistoWanted and prvHistoFits
         if prevOn
             int span = math.max(1, prvProf.endBar - prvProf.startBar)
             int w = math.max(2, int(math.round(span * histoWidthPct / 100.0)))
@@ -2092,6 +2545,85 @@ renderStructure() =>
         putLevel(structLines, 4, pdOn, nz(lastSLBar, x2), x2, drLo, color.new(cBull, 40), 1, line.style_dotted, false)
 
 // ============================================================================
+//  14d. LIQUIDITY + IMBALANCE RENDER                                      [P6]
+// ============================================================================
+
+var array<box>   fvgBoxes  = array.new<box>()
+var array<line>  liqLines  = array.new<line>()
+var array<label> liqLabels = array.new<label>()
+var array<label> swpLabels = array.new<label>()
+
+renderImbalance() =>
+    int firstDrawBar = last_bar_index - maxDrawBars
+    int n = showFacts and showFvg ? array.size(zones) : 0
+    syncBoxes(fvgBoxes, n)
+    if n > 0
+        for i = 0 to n - 1
+            Zone z = array.get(zones, i)
+            box b = array.get(fvgBoxes, i)
+            bool vis = z.startBar >= firstDrawBar and (z.active or not hideMitigated)
+            color col = z.bull ? cBull : cBear
+            int alpha = z.active ? 82 : 93
+            box.set_lefttop(b, z.startBar, z.top)
+            box.set_rightbottom(b, math.max(z.startBar + 1, bar_index), z.bot)
+            box.set_bgcolor(b, vis ? color.new(col, alpha) : color.new(col, 100))
+            box.set_border_color(b, vis ? color.new(col, 70) : color.new(col, 100))
+            box.set_border_width(b, 1)
+
+renderLiquidity() =>
+    int firstDrawBar = last_bar_index - maxDrawBars
+    int n = showFacts and (showEqual or showPools) ? array.size(liqPrice) : 0
+    syncLines(liqLines, n)
+    syncLabels(liqLabels, showLiqLabels ? n : 0)
+    if n > 0
+        for i = 0 to n - 1
+            float lv    = array.get(liqPrice, i)
+            int   lb    = array.get(liqBar, i)
+            int   tc    = array.get(liqTouch, i)
+            bool  isHi  = array.get(liqIsHigh, i)
+            bool  swept = array.get(liqSwept, i)
+            bool  isEq  = tc >= 2
+            // Equal highs/lows are the pools worth drawing; single swings are
+            // only shown when the user asked for all pools.
+            bool vis = lb >= firstDrawBar and (isEq ? showEqual : showPools) and not swept
+            color col = isHi ? cBear : cBull
+
+            line ln = array.get(liqLines, i)
+            line.set_xy1(ln, lb, lv)
+            line.set_xy2(ln, bar_index, lv)
+            line.set_color(ln, vis ? color.new(col, isEq ? 20 : 60) : color.new(col, 100))
+            line.set_style(ln, isEq ? line.style_solid : line.style_dotted)
+            line.set_width(ln, isEq ? 2 : 1)
+            line.set_extend(ln, vis and isEq ? extend.right : extend.none)
+
+            if showLiqLabels and i < array.size(liqLabels)
+                label lb2 = array.get(liqLabels, i)
+                label.set_xy(lb2, bar_index, lv)
+                label.set_text(lb2, vis and isEq ? (isHi ? "EQH x" : "EQL x") + str.tostring(tc) : "")
+                label.set_style(lb2, label.style_label_left)
+                label.set_color(lb2, color.new(color.black, 100))
+                label.set_textcolor(lb2, vis and isEq ? col : color.new(col, 100))
+
+    // Sweeps: the confirmed one, and the pending one while it waits.
+    syncLabels(swpLabels, showFacts and showSweeps ? 2 : 0)
+    if showFacts and showSweeps
+        label s0 = array.get(swpLabels, 0)
+        bool v0 = not na(lastSweepBar) and lastSweepBar >= firstDrawBar
+        label.set_xy(s0, nz(lastSweepBar, bar_index), nz(lastSweepLevel, close))
+        label.set_text(s0, v0 ? (lastSweepSide > 0 ? "sweep BSL" : "sweep SSL") : "")
+        label.set_style(s0, lastSweepSide > 0 ? label.style_label_down : label.style_label_up)
+        label.set_color(s0, color.new(color.black, 100))
+        label.set_textcolor(s0, v0 ? cAccent : color.new(cAccent, 100))
+
+        label s1 = array.get(swpLabels, 1)
+        bool v1 = not na(sweepPendBar) and sweepPendBar >= firstDrawBar
+        label.set_xy(s1, nz(sweepPendBar, bar_index), nz(sweepPendLevel, close))
+        label.set_text(s1, v1 ? "sweep?" : "")
+        label.set_style(s1, sweepPendSide > 0 ? label.style_label_down : label.style_label_up)
+        label.set_color(s1, color.new(color.black, 100))
+        label.set_textcolor(s1, v1 ? cWarn : color.new(cWarn, 100))
+
+// ============================================================================
 //  15. RENDER
 // ============================================================================
 
@@ -2105,16 +2637,18 @@ bool inDrawWindow = bar_index > last_bar_index - maxDrawBars
 if barstate.islast
     renderProfiles()
     renderStructure()
+    renderImbalance()
+    renderLiquidity()
 
 if barstate.islast
     if showDash
         renderDashboard()
     else
-        table.clear(dash, 0, 0, 4, 27)
+        table.clear(dash, 0, 0, 4, 29)
     if dbgOn
         renderDebug()
     else
-        table.clear(dbg, 0, 0, 2, 51)
+        table.clear(dbg, 0, 0, 2, 65)
 
 // Keeps the pane scale stable and gives the script a plot to hang alerts on
 // in later phases. Invisible by design.
