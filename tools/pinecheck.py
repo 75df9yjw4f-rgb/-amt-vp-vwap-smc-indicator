@@ -205,6 +205,38 @@ def main(path):
             problems.append(('EXTERNAL_ELEMENTS', fline + 1,
                 f"{fname}() ~{est} external elements (limit 254) - split it"))
 
+    # ---- 6. same-scope duplicate declarations --------------------------
+    # Pine allows the same name in sibling blocks (two `if` branches, two
+    # `for` loops), so a flat name count produces false positives. Track the
+    # indent stack instead: a declaration collides only with one already made
+    # at the same indent inside the same enclosing block. This is the class
+    # TradingView reports as `"x" is already defined (CE10095)`.
+    DECL = re.compile(r'^(\s*)(?:var\s+|varip\s+)?'
+                      r'(?:int|float|bool|string|color|line|label|box|table|array|matrix|map'
+                      r'|linefill|polyline|chart\.point|[A-Z]\w*)'
+                      r'(?:<[^>]+>)?\s+(\w+)\s*=(?!=)')
+    scopes = [(-1, set())]          # (indent, names declared at that indent)
+    for i, l in enumerate(code):
+        if not l.strip():
+            continue
+        ind = indent(l)
+        while len(scopes) > 1 and ind < scopes[-1][0]:
+            scopes.pop()
+        m = DECL.match(l)
+        if not m:
+            # a deeper line opens a nested scope for anything that follows
+            if ind > scopes[-1][0]:
+                scopes.append((ind, set()))
+            continue
+        name = m.group(2)
+        if ind > scopes[-1][0]:
+            scopes.append((ind, set()))
+        names = scopes[-1][1]
+        if name in names:
+            problems.append(('DUPLICATE_DECL', i + 1,
+                f"'{name}' is already defined in this scope (CE10095)"))
+        names.add(name)
+
     # ---- report ------------------------------------------------------------
     seen = set()
     uniq = []

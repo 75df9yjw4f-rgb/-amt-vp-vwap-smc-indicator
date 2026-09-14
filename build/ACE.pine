@@ -3000,12 +3000,10 @@ dashSummary(int r0) =>
         r += 1
     r
 
-//@function Dashboard rows, part 3 of 4. Split for the same reason as
-//          the debug blocks: the 254 external-element limit is per function.
-//@function Dashboard rows, part 3a. Split again purely for the per-function
-//          external-element limit; rows and order are unchanged.
+//@function Dashboard rows, part 3a of 5. Split for the same reason as the debug
+//          blocks: the 254 external-element limit is per function. Rows and
+//          their order are unchanged.
 dashLevels(int r0) =>
-    int r = r0
     int r = r0
     // ---- levels (always shown: makes the score hand-verifiable)
     dcell(0, r, "LEVELS", cMuted, text.align_left)
@@ -3034,7 +3032,7 @@ dashLevels(int r0) =>
     r += 1
     r
 
-//@function Dashboard rows, part 3b.
+//@function Dashboard rows, part 3b of 5.
 dashLevels2(int r0) =>
     int r = r0
     dcell(0, r, "LIQUIDITY", cMuted, text.align_left)
