@@ -207,3 +207,75 @@ def b3s(h):
 
 
 SCALP = {'B1s': b1s, 'B2s': b2s, 'B3s': b3s}
+
+
+# ---------------------------------------------------------------------------
+#  PERCENT-BRACKET VARIANTS - fixed take-profit and stop as a share of price
+# ---------------------------------------------------------------------------
+#  Entries are still the ACE ones. Both exits are a fixed fraction of the entry
+#  price rather than a multiple of ATR, which is a real difference and not a
+#  reparametrisation: a percentage does not adapt to volatility. On this dataset
+#  0.15% is about 2.9 ATR when volatility sits at its 10th percentile and about
+#  1.1 ATR at its 90th, so the same rule is a distant target in quiet conditions
+#  and a near one in busy conditions.
+#
+#  Measured on XAUUSD 3m: ATR(14) median 3.67 points, 0.081% of price. So 0.1%
+#  is 1.23 ATR and 0.2% is 2.46 ATR - these are not sub-noise targets.
+
+def pct_bracket(entry_fn, tgt_pct, stop_pct, tag):
+    """Wraps an ACE entry rule in a fixed-percentage bracket."""
+    def f(h):
+        sig = entry_fn(h)
+        if sig is None:
+            return None
+        e = sig['entry']
+        sgn = 1 if sig['side'] == 'LONG' else -1
+        return {'baseline': tag, 'side': sig['side'], 'entry': e,
+                'stop': e - sgn * e * stop_pct / 100.0,
+                'target': e + sgn * e * tgt_pct / 100.0,
+                'exit_on_bias_neutral': False}
+    return f
+
+
+def _entry_b2(h):
+    """B2's entry alone, without its ATR target or the target-validity gate."""
+    if len(h) < 2:
+        return None
+    c, p = h[-1], h[-2]
+    if not _ok(c.get('dev_vah'), c.get('dev_val'), p.get('dev_vah'),
+               p.get('dev_val'), c.get('atr')) or c['atr'] <= 0:
+        return None
+    if p['close'] < p['dev_val'] and c['close'] > c['dev_val']:
+        side = 'LONG'
+    elif p['close'] > p['dev_vah'] and c['close'] < c['dev_vah']:
+        side = 'SHORT'
+    else:
+        return None
+    return {'baseline': 'B2', 'side': side, 'entry': c['close'],
+            'stop': c['close'], 'target': c['close']}
+
+
+def _entry_b3(h):
+    if len(h) < 2:
+        return None
+    c, p = h[-1], h[-2]
+    if not _ok(c.get('vwap_sess'), p.get('vwap_sess'), c.get('bias'), c.get('atr')) \
+       or c['atr'] <= 0:
+        return None
+    if p['close'] <= p['vwap_sess'] and c['close'] > c['vwap_sess'] and c['bias'] > 0:
+        side = 'LONG'
+    elif p['close'] >= p['vwap_sess'] and c['close'] < c['vwap_sess'] and c['bias'] < 0:
+        side = 'SHORT'
+    else:
+        return None
+    return {'baseline': 'B3', 'side': side, 'entry': c['close'],
+            'stop': c['close'], 'target': c['close']}
+
+
+ENTRIES = {'B1': b1_bias_flip, 'B2': _entry_b2, 'B3': _entry_b3}
+
+
+def pct_book(tgt_pct, stop_pct):
+    """The three ACE entries under one percentage bracket."""
+    return {f'{k}p': pct_bracket(fn, tgt_pct, stop_pct, f'{k}p')
+            for k, fn in ENTRIES.items()}

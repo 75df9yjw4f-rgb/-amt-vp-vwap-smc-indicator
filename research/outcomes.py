@@ -8,12 +8,18 @@ out of the snapshot.
 from baselines import MAX_BARS, BIAS_NEUTRAL
 
 
-def simulate(rows, i, sig, max_bars=MAX_BARS):
+def simulate(rows, i, sig, max_bars=MAX_BARS, optimistic=False):
     """Walk forward from the bar AFTER the signal bar and resolve the trade.
 
     Pessimistic convention, fixed in docs/15: when a single bar contains both the
     stop and the target, the stop is taken. Intrabar order is unknowable from
     OHLC, and assuming the good fill would flatter every result here.
+
+    `optimistic=True` resolves those same bars the other way. It exists to
+    measure how much the convention decides, not to replace it: with a symmetric
+    bracket such bars are common, so a result that only survives one assumption
+    is a result about the assumption. Runs are reported as a bracket between the
+    two.
     """
     entry, stop, target = sig['entry'], sig['stop'], sig['target']
     long_ = sig['side'] == 'LONG'
@@ -37,9 +43,14 @@ def simulate(rows, i, sig, max_bars=MAX_BARS):
 
         hit_stop = (r['low'] <= stop) if long_ else (r['high'] >= stop)
         hit_tgt = (r['high'] >= target) if long_ else (r['low'] <= target)
+        if hit_stop and hit_tgt and optimistic:
+            rr = (target - entry) / risk if long_ else (entry - target) / risk
+            return {'outcome': 'TARGET', 'exit_price': target, 'bars_held': k,
+                    'r_multiple': rr, 'mfe_r': mfe, 'mae_r': mae, 'ambiguous': True}
         if hit_stop:
             return {'outcome': 'STOP', 'exit_price': stop, 'bars_held': k,
-                    'r_multiple': -1.0, 'mfe_r': mfe, 'mae_r': mae}
+                    'r_multiple': -1.0, 'mfe_r': mfe, 'mae_r': mae,
+                    'ambiguous': bool(hit_tgt)}
         if hit_tgt:
             rr = (target - entry) / risk if long_ else (entry - target) / risk
             return {'outcome': 'TARGET', 'exit_price': target, 'bars_held': k,
