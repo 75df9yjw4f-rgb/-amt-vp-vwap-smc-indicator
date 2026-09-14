@@ -1668,28 +1668,35 @@ vwapAdd(VwapAcc a, float src, float vol) =>
 
 //@function Rebuilds an accumulator from `back` bars ago up to the current bar.
 //          Used by anchors that can move (highest high, lowest low).
-vwapRebuild(VwapAcc a, int back) =>
-    a.sumPV     := 0.0
-    a.sumV      := 0.0
-    a.sumP2V    := 0.0
-    a.vwap      := na
-    a.sd        := na
-    a.anchorBar := bar_index - back
-    a.active    := true
-    a.valid     := false
-    if back >= 0
-        for i = back to 0
-            float s = vwapSrc[i]
-            float v = nz(volume[i])
-            if not na(s) and v > 0
-                a.sumPV  := a.sumPV + s * v
-                a.sumV   := a.sumV + v
-                a.sumP2V := a.sumP2V + s * s * v
-        if a.sumV > 0
-            a.vwap := a.sumPV / a.sumV
-            float m2 = a.sumP2V / a.sumV
-            a.sd    := math.sqrt(math.max(m2 - a.vwap * a.vwap, 0.0))
-            a.valid := true
+//@function Rebuilds an accumulator from `back` bars ago. `doRebuild` is a
+//          parameter rather than a condition at the call site because the body
+//          reads `vwapSrc[i]` / `volume[i]` at a variable offset: Pine requires
+//          such a function to be called on every calculation (CW10003). The
+//          rebuild itself is gated exactly as before, so nothing about when a
+//          rebuild happens has changed.
+vwapRebuild(VwapAcc a, int back, bool doRebuild) =>
+    if doRebuild
+        a.sumPV     := 0.0
+        a.sumV      := 0.0
+        a.sumP2V    := 0.0
+        a.vwap      := na
+        a.sd        := na
+        a.anchorBar := bar_index - back
+        a.active    := true
+        a.valid     := false
+        if back >= 0
+            for i = back to 0
+                float s = vwapSrc[i]
+                float v = nz(volume[i])
+                if not na(s) and v > 0
+                    a.sumPV  := a.sumPV + s * v
+                    a.sumV   := a.sumV + v
+                    a.sumP2V := a.sumP2V + s * s * v
+            if a.sumV > 0
+                a.vwap := a.sumPV / a.sumV
+                float m2 = a.sumP2V / a.sumV
+                a.sd    := math.sqrt(math.max(m2 - a.vwap * a.vwap, 0.0))
+                a.valid := true
 
 // ---- period anchors --------------------------------------------------------
 // All of these look only at the CURRENT and PREVIOUS bar. No lookahead, no
@@ -1735,6 +1742,12 @@ vwapAdd(accMonthly, vwapSrc, volume)
 //          selected they would simply not run.
 vwapApplyAnchor(VwapAcc a, AnchorMode mode, int anchorTime, int hhBack, int llBack) =>
     string status = "ok"
+    // The rebuild request is collected here and executed once, unconditionally,
+    // at the end of the function. Only one branch below can run and only one of
+    // rebuild/add happens per branch, so this is the same work in the same
+    // order - it just keeps the vwapRebuild() call out of conditional scope.
+    int  rbBack = 0
+    bool rbDo   = false
     if mode == AnchorMode.dateTime
         if time >= anchorTime and (na(time[1]) or time[1] < anchorTime)
             vwapReset(a)
@@ -1762,7 +1775,8 @@ vwapApplyAnchor(VwapAcc a, AnchorMode mode, int anchorTime, int hhBack, int llBa
         int ab = bar_index - back
         if na(a.srcAnchor) or a.srcAnchor != ab
             a.srcAnchor := ab
-            vwapRebuild(a, back)
+            rbBack := back
+            rbDo   := true
         else
             vwapAdd(a, vwapSrc, volume)
     else if mode == AnchorMode.lowestLow
@@ -1770,7 +1784,8 @@ vwapApplyAnchor(VwapAcc a, AnchorMode mode, int anchorTime, int hhBack, int llBa
         int ab = bar_index - back
         if na(a.srcAnchor) or a.srcAnchor != ab
             a.srcAnchor := ab
-            vwapRebuild(a, back)
+            rbBack := back
+            rbDo   := true
         else
             vwapAdd(a, vwapSrc, volume)
     else
@@ -1794,9 +1809,11 @@ vwapApplyAnchor(VwapAcc a, AnchorMode mode, int anchorTime, int hhBack, int llBa
             // would run the rebuild loop continuously.
             if na(a.srcAnchor) or a.srcAnchor != ab
                 a.srcAnchor := ab
-                vwapRebuild(a, back)
+                rbBack := back
+                rbDo   := true
             else
                 vwapAdd(a, vwapSrc, volume)
+    vwapRebuild(a, rbBack, rbDo)
     status
 
 // Evaluated unconditionally on every bar so their series state stays correct,
@@ -2527,8 +2544,14 @@ if na(refLo)
 else
     closesBelow := close < refLo ? closesBelow + 1 : 0
 
-float timeAboveFrac = na(refHi) ? na : math.sum(close > refHi ? 1.0 : 0.0, accWindow) / accWindow
-float timeBelowFrac = na(refLo) ? na : math.sum(close < refLo ? 1.0 : 0.0, accWindow) / accWindow
+// math.sum() keeps a rolling window and must therefore run on every bar, not
+// only when the reference level exists (CW10004). A na reference makes the
+// comparison false, so the term contributed is 0.0 either way - the same value
+// the ternary discarded before.
+float timeAboveRaw = math.sum(close > refHi ? 1.0 : 0.0, accWindow) / accWindow
+float timeBelowRaw = math.sum(close < refLo ? 1.0 : 0.0, accWindow) / accWindow
+float timeAboveFrac = na(refHi) ? na : timeAboveRaw
+float timeBelowFrac = na(refLo) ? na : timeBelowRaw
 
 bool valueMigratedUp = not accNeedsMigration or (not na(devPoc) and not na(refHi) and devPoc > refHi)
 bool valueMigratedDn = not accNeedsMigration or (not na(devPoc) and not na(refLo) and devPoc < refLo)
@@ -3364,6 +3387,8 @@ dbgBlock4(int r0) =>
 
 //@function Debug rows, part 5 of 5. The split exists only to stay
 //          under the 254 external-element limit Pine applies PER FUNCTION.
+//@function Debug rows, part 5 of 5. The split exists only to stay
+//          under the 254 external-element limit Pine applies PER FUNCTION.
 //          Every original row is preserved, in the original order.
 dbgBlock5(int r0) =>
     int r = r0
@@ -3393,35 +3418,12 @@ dbgBlock5(int r0) =>
     r += 1
     r
 
-renderDebug() =>
-    table.clear(dbg, 0, 0, 2, 99)
-    int r = 0
-    table.cell(dbg, 0, r, "ACE DEBUG", text_color = cText, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(dbg, 1, r, ACE_VERSION, text_color = cAccent, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(dbg, 2, r, ACE_PHASE, text_color = cMuted, text_size = size.tiny, text_halign = text.align_left)
-    r += 1
-    if dbgRuntime
-        r := dbgBlock1(r)
-        r := dbgBlock2(r)
-        r := dbgBlock3(r)
-        r := dbgBlock4(r)
-        r := dbgBlock5(r)
-
-    if dbgEngines
-        dbgEngineRow(r, engProfile)
-        r += 1
-        dbgEngineRow(r, engStruct)
-        r += 1
-        dbgEngineRow(r, engVwap)
-        r += 1
-        dbgEngineRow(r, engAmt)
-        r += 1
-        dbgEngineRow(r, engLiq)
-        r += 1
-        dbgEngineRow(r, engImb)
-        r += 1
-        dbgEngineRow(r, engVol)
-        r += 1
+// The debug table is rendered inline at global scope rather than from a
+// render function. The 254 external-element limit is per user-defined
+// function and it counts through calls, so wrapping the dbgBlockN() helpers
+// in a renderDebug() function put all of their inputs back into one count
+// (265, CE10116). Global scope has no such limit; the rows, their order and
+// their content are unchanged.
 // ============================================================================
 //  14b. PROFILE RENDER                                                    [P1]
 //  Objects are pooled and updated in place - never recreated per bar - so the
@@ -3752,7 +3754,34 @@ if barstate.islast
         table.clear(dash, 0, 0, 4, 35)
         true
     if dbgOn
-        renderDebug()
+        table.clear(dbg, 0, 0, 2, 99)
+        int r = 0
+        table.cell(dbg, 0, r, "ACE DEBUG", text_color = cText, text_size = size.tiny, text_halign = text.align_left)
+        table.cell(dbg, 1, r, ACE_VERSION, text_color = cAccent, text_size = size.tiny, text_halign = text.align_left)
+        table.cell(dbg, 2, r, ACE_PHASE, text_color = cMuted, text_size = size.tiny, text_halign = text.align_left)
+        r += 1
+        if dbgRuntime
+            r := dbgBlock1(r)
+            r := dbgBlock2(r)
+            r := dbgBlock3(r)
+            r := dbgBlock4(r)
+            r := dbgBlock5(r)
+
+        if dbgEngines
+            dbgEngineRow(r, engProfile)
+            r += 1
+            dbgEngineRow(r, engStruct)
+            r += 1
+            dbgEngineRow(r, engVwap)
+            r += 1
+            dbgEngineRow(r, engAmt)
+            r += 1
+            dbgEngineRow(r, engLiq)
+            r += 1
+            dbgEngineRow(r, engImb)
+            r += 1
+            dbgEngineRow(r, engVol)
+            r += 1
         true
     else
         table.clear(dbg, 0, 0, 2, 99)

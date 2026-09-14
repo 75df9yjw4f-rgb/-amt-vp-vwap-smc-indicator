@@ -173,37 +173,106 @@ def main(path):
                 'change','valuewhen','cum','sma','ema','rma','atr','highest','lowest',
                 'pivothigh','pivotlow','rising','falling','mom','roc','stdev')
     for i, l in enumerate(code):
-        for m in re.finditer(r'\bta\.(\w+)\s*\(', l):
-            if m.group(1) not in STATEFUL:
+        # math.sum keeps a rolling window, so it belongs to the same class as
+        # the stateful ta.* calls; TradingView reports it as CW10004.
+        for m in re.finditer(r'\b(?:ta|math)\.(\w+)\s*\(', l):
+            if m.group(1) not in STATEFUL and m.group(0).split('.')[0] != 'math':
+                continue
+            if m.group(0).startswith('math.') and m.group(1) != 'sum':
                 continue
             indented = len(l) - len(l.lstrip()) > 0
             before = l[:m.start()]
-            guarded = bool(re.search(r'(\?|\band\b|\bor\b)\s*$', before.rstrip()))
+            # Either operand of a ternary is conditional, not just the text
+            # right after the `?`, so any unclosed `?` earlier on the line
+            # counts - that is the CW10004 shape TradingView reports.
+            guarded = bool(re.search(r'(\?|\band\b|\bor\b)\s*$', before.rstrip())) \
+                      or '?' in re.sub(r'"[^"]*"', '', before)
             if indented or guarded:
                 why = 'conditional scope' if indented else 'behind and/or/?: (short-circuit)'
                 problems.append(('TA_SCOPE', i + 1,
-                    f"ta.{m.group(1)}() in {why} - hoist it to global scope"))
+                    f"{m.group(0)[:-1]}() in {why} - hoist it to global scope"))
 
-    # ---- 5. external elements per function -----------------------------
-    KW2 = KEYWORDS | {'to', 'by'}
+    # ---- 5. external elements per function (transitive) ------------------
+    # Pine counts, per user-defined function, the elements the body reaches
+    # that live outside it - and it counts THROUGH calls, so a wrapper that
+    # merely calls five helpers carries the union of all five. int/float/bool
+    # cost 2, everything else 1. Calibrated against a TradingView-reported
+    # 265 for renderDebug(), where this model gives 275.
+    NUM = {'int', 'float', 'bool'}
+    gtype = {}
+    for l in code:
+        m = re.match(r'^(?:var\s+|varip\s+)?(\w+)(?:<[^>]*>)?\s+(\w+)\s*=', l)
+        # `float x = ...` declares x: the type word is a keyword, the NAME is
+        # what we record, so KEYWORDS must not filter the declaration away.
+        if m and m.group(1) not in ('if', 'else', 'for', 'while', 'switch'):
+            gtype.setdefault(m.group(2), m.group(1))
+    bodies = {}
     for fname, (fline, params) in fns.items():
-        pnames = {p.strip().split()[-1] for p in params.split(',') if p.strip()}
-        loc, body, j = set(pnames), [], fline + 1
-        while j < len(code):
-            if code[j].strip() and indent(code[j]) == 0: break
-            body.append(code[j]); j += 1
-        for l in body:
-            for rx in (r'^\s+(?:var\s+)?(?:\w+(?:<[^>]+>)?)\s+(\w+)\s*=', r'^\s+for\s+(\w+)'):
-                m = re.match(rx, l)
-                if m: loc.add(m.group(1))
-        txt = '\n'.join(body)
-        toks = re.findall(r'(?<![\w.])([A-Za-z_]\w*(?:\.\w+)?)', txt)
-        ext = [t for t in toks if t.split('.')[0] not in loc and t.split('.')[0] not in KW2]
-        # Calibrated against a reported 265/254 for a body measuring 557 here.
-        est = int(len(ext) * 265 / 557)
-        if est > 200:
+        pl = [p.strip() for p in params.split(',') if p.strip()]
+        pcost = sum(2 if p.split()[0] in NUM else 1 for p in pl)
+        body, j2 = [], fline + 1
+        while j2 < len(code):
+            if code[j2].strip() and indent(code[j2]) == 0: break
+            body.append(code[j2]); j2 += 1
+        bodies[fname] = (pcost, {p.split()[-1] for p in pl}, '\n'.join(body))
+
+    def reach(name, seen, globs, acc):
+        if name in seen: return
+        seen.add(name)
+        pcost, pnames, body = bodies[name]
+        acc[0] += pcost
+        loc = set(pnames)
+        for l in body.split('\n'):
+            m = re.match(r'^\s+(?:var\s+)?(\w+)(?:<[^>]*>)?\s+(\w+)\s*=', l)
+            if m: loc.add(m.group(2))
+            m = re.match(r'^\s+for\s+(\w+)', l)
+            if m: loc.add(m.group(1))
+        for t in set(re.findall(r'(?<![\w.])([A-Za-z_]\w*)', body)):
+            if t in gtype and t not in loc and t not in bodies:
+                globs.add(t)
+        for t in set(re.findall(r'(?<![\w.])(\w+)\s*\(', body)):
+            if t in bodies: reach(t, seen, globs, acc)
+
+    for fname, (fline, _) in fns.items():
+        globs, acc = set(), [0]
+        reach(fname, set(), globs, acc)
+        est = acc[0] + sum(2 if gtype[g] in NUM else 1 for g in globs)
+        if est > 230:
             problems.append(('EXTERNAL_ELEMENTS', fline + 1,
-                f"{fname}() ~{est} external elements (limit 254) - split it"))
+                f"{fname}() ~{est} external elements (limit 254) - split it, or "
+                f"move the body to global scope if it is only a wrapper"))
+
+    # ---- 5b. user functions that must run on every calculation -----------
+    # A function whose own body reads a series at a VARIABLE offset (`src[i]`)
+    # or calls a stateful builtin depends on Pine having maintained its history
+    # on every bar. Calling it from a conditional scope is CW10003. Constant
+    # offsets like `time[1]` do not count, which is why this looks at the
+    # function's own body only and not at what it calls.
+    hist = set()
+    for fname, (pcost, pnames, body) in bodies.items():
+        varoff = re.search(r'\w\s*\[\s*(?!\d+\s*\])[A-Za-z_]\w*\s*\]', body)
+        stateful = re.search(r'\bta\.(?:' + '|'.join(STATEFUL) + r')\s*\(|\bmath\.sum\s*\(', body)
+        if varoff or stateful:
+            hist.add(fname)
+    fnline = {fline for fline, _ in fns.values()}
+    infn = False
+    for i, l in enumerate(code):
+        if i in fnline:
+            infn = True
+        elif l.strip() and indent(l) == 0:
+            infn = False
+        # The top level of a function body is unconditional, so the baseline to
+        # compare against is 4 inside a function and 0 at global scope.
+        base = 4 if infn else 0
+        for m in re.finditer(r'(?<![\w.])(\w+)\s*\(', l):
+            if m.group(1) not in hist:
+                continue
+            before = l[:m.start()]
+            if indent(l) > base or '?' in re.sub(r'"[^"]*"', '', before):
+                problems.append(('CONDITIONAL_CALL', i + 1,
+                    f"{m.group(1)}() reads history at a variable offset and is "
+                    f"called in conditional scope - make the call unconditional "
+                    f"and pass the condition in as a parameter"))
 
     # ---- 6. same-scope duplicate declarations --------------------------
     # Pine allows the same name in sibling blocks (two `if` branches, two
@@ -241,8 +310,8 @@ def main(path):
     seen = set()
     uniq = []
     for kind, ln, msg in problems:
-        if (kind, msg) in seen: continue
-        seen.add((kind, msg)); uniq.append((kind, ln, msg))
+        if (kind, ln, msg) in seen: continue
+        seen.add((kind, ln, msg)); uniq.append((kind, ln, msg))
     print(f"{path}: {len(uniq)} problem(s)\n")
     for kind, ln, msg in sorted(uniq, key=lambda x: x[1]):
         print(f"  [{kind}] L{ln}: {msg}")
