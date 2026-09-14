@@ -56,7 +56,11 @@ def load(path):
     lines = [l.rstrip('\n') for l in open(path, encoding='utf-8-sig')
              if l.strip() and not l.lstrip().startswith('#')]
     if len(lines) < 2:
-        raise ValueError("need a header line and at least one data line")
+        # The empty template is the likeliest thing to be run by mistake, so say
+        # what to do rather than raising at the user.
+        raise ValueError(
+            "the file has a header but no data rows - fill in the bars first "
+            "(one per line, oldest at the top)")
 
     header = [ALIASES.get(h.strip().lower()) for h in split(lines[0])]
     known = [h for h in header if h]
@@ -87,7 +91,11 @@ def main():
     if len(sys.argv) != 3:
         print("usage: paste_import.py <pasted.txt> <out.csv>")
         return 2
-    rows, known, bad = load(sys.argv[1])
+    try:
+        rows, known, bad = load(sys.argv[1])
+    except ValueError as e:
+        print(f"cannot read {sys.argv[1]}: {e}")
+        return 1
     with open(sys.argv[2], 'w', newline='', encoding='utf-8') as fh:
         w = csv.DictWriter(fh, fieldnames=known)
         w.writeheader()
