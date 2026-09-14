@@ -23,6 +23,8 @@ def run(rows, decider, symbol="ANON-1", timeframe="TF-A", which=("B1", "B2", "B3
         for name in which:
             if i < open_until.get(name, -1):
                 continue                # one position per baseline at a time
+            if not rows[i].get('gap_ok', True):
+                continue        # hole in the series; see mark_gaps()
             sig = BASELINES[name](history)
             if not sig:
                 continue

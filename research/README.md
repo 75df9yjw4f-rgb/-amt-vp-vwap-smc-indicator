@@ -21,6 +21,7 @@ Do not change them after a run.
 | `selftest_stats.py` | calibrates the verdict table against known-skill inputs |
 | `veto_prompt.md` | the frozen prompt |
 | `make_synthetic.py` | builds a fake-ACE CSV for testing the machinery only |
+| `parse_alerts.py` | turns collected heartbeat-alert messages into the same CSV schema |
 
 ## Running
 
@@ -35,12 +36,19 @@ python3 research/metrics.py research/out/armA.jsonl
 
 ## Getting real data
 
-The harness has no data and cannot fetch any: exporting from TradingView is a
-manual action in the UI, available to the account owner.
+Two routes, both manual on the TradingView side. See `../docs/17-phase0-data-acquisition.md`.
 
-1. Open the chart with ACE. Set the symbol, timeframe and period.
-2. `Export chart data…` → CSV (needs Pro+ / Premium).
-3. Drop the file in `research/data/`.
+1. **Chart data export** — `Export chart data…` in the chart's top-right menu, with
+   ACE on the chart and history scrolled in. The current pricing page lists this on
+   every tier including free Basic; check before assuming it is unavailable.
+2. **Heartbeat alerts** — an always-true alert firing once per bar close, carrying the
+   plotted ACE values via `{{plot("...")}}`. Collect the messages, then:
+
+   ```bash
+   python3 research/parse_alerts.py collected.txt research/data/FORWARD-01.csv
+   ```
+
+Either way the file lands in `research/data/` and the rest of the pipeline is identical.
 
 Until that exists, no verdict can be produced. `research/data/SYNTHETIC-*.csv`
 holds fabricated ACE columns and exists only to exercise the code; any P&L

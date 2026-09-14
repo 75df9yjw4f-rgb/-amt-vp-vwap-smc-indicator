@@ -6,6 +6,7 @@ script plots. Everything this module exposes comes either from the CSV or from
 OHLC arithmetic; nothing is reconstructed or guessed.
 """
 import csv, math, re
+from datetime import datetime
 
 # Canonical field name -> the spellings a TradingView export may use. Titles come
 # straight from plot() calls in ACE, and the sigma character survives the export,
@@ -89,8 +90,9 @@ def load_csv(path):
             continue
         rows.append(row)
 
-    rows.sort(key=lambda x: x.get('time') or '')
+    rows.sort(key=_sort_key)
     add_atr(rows)
+    mark_gaps(rows)
     present = sorted(mapping)
     missing = sorted(set(COLUMNS) - set(mapping))
     return rows, present, missing
@@ -123,4 +125,60 @@ def add_atr(rows, length=ATR_LEN):
         else:
             atr = (atr * (length - 1) + trs[i]) / length
             r['atr'] = atr
+    return rows
+
+
+def _ts(v):
+    """Seconds since epoch from a unix number or an ISO-8601 string, else None.
+
+    Exports and alert messages do not agree on a time format, so both are
+    accepted rather than one being assumed.
+    """
+    if v is None or v == '':
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        pass
+    txt = str(v).strip().replace('Z', '+00:00')
+    for fmt in (None, '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d'):
+        try:
+            dt = datetime.fromisoformat(txt) if fmt is None \
+                else datetime.strptime(txt, fmt)
+            return dt.timestamp()
+        except (ValueError, OSError):
+            continue
+    return None
+
+
+def _sort_key(row):
+    t = _ts(row.get('time'))
+    return (0, t) if t is not None else (1, str(row.get('time') or ''))
+
+
+def mark_gaps(rows):
+    """Flags bars whose predecessor is more than one timeframe away.
+
+    Forward collection through alerts drops bars: delivery is not guaranteed and
+    sessions break. A hole is an absent bar, not a bar of zero movement, so a
+    baseline comparing two rows across a hole would read a cross that never
+    happened. Such signals are discarded (docs/15, Amendment 1).
+
+    The interval is taken as the median spacing rather than a configured value,
+    so the rule works on any timeframe without being told which.
+    """
+    ts = [_ts(r.get('time')) for r in rows]
+    deltas = sorted(b - a for a, b in zip(ts, ts[1:])
+                    if a is not None and b is not None and b > a)
+    if not deltas:
+        for r in rows:
+            r['gap_ok'] = True          # no usable timestamps: rule cannot apply
+        return rows
+    interval = deltas[len(deltas) // 2]
+    tol = interval * 1.5
+    for i, r in enumerate(rows):
+        if i == 0 or ts[i] is None or ts[i - 1] is None:
+            r['gap_ok'] = i > 0
+        else:
+            r['gap_ok'] = (ts[i] - ts[i - 1]) <= tol
     return rows
