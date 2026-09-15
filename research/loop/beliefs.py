@@ -17,10 +17,18 @@ BREAKEVEN = 0.50   # 1:1 bracket
 WEAK = 0.35
 
 
-def status_for(n, wins):
+def status_for(n, wins, direction='wins'):
+    """`direction` says what the belief predicts.
+
+    Without it every belief is read as predicting a win, so a belief phrased as
+    "this subset loses" gets stamped REJECTED by the very record that confirms
+    it. That bug shipped once (batch 3) and mislabelled B2 and B4.
+    """
     if n < MIN_N:
         return 'UNTESTED'
     wr = wins / n
+    if direction == 'loses':
+        wr = 1.0 - wr
     if wr >= BREAKEVEN:
         return 'HELD'
     if wr >= WEAK:
@@ -49,7 +57,7 @@ def evaluate(beliefs, outcomes, decisions):
             if o['r'] > 0:
                 wins += 1
         prev = bl.get('status', 'UNTESTED')
-        cur = status_for(n, wins)
+        cur = status_for(n, wins, bl.get('direction', 'wins'))
         out.append({**bl, 'n': n, 'wins': wins,
                     'win_rate': round(wins / n, 3) if n else None,
                     'mean_r': round(sum(rs) / n, 3) if n else None,

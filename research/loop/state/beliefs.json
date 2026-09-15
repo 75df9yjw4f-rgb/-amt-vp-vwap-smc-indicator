@@ -6,14 +6,16 @@
   "status": "HELD",
   "history": [
    "UNTESTED→HELD @n=8"
-  ]
+  ],
+  "direction": "wins"
  },
  {
   "id": "B2",
   "statement": "Шорт от сжатия ПОСЛЕ уже состоявшегося падения (net20 <= -2.0) проигрывает — ход исчерпан.",
   "scope": "net20 <= -2.0",
   "status": "UNTESTED",
-  "history": []
+  "history": [],
+  "direction": "loses"
  },
  {
   "id": "B3",
@@ -22,6 +24,31 @@
   "status": "HELD",
   "history": [
    "UNTESTED→HELD @n=16"
-  ]
+  ],
+  "direction": "wins"
+ },
+ {
+  "id": "B4",
+  "statement": "Шорт от сжатия при net20 <= -1.0 проигрывает (ход вниз уже исчерпан).",
+  "scope": "net20 <= -1.0",
+  "status": "UNTESTED",
+  "history": [],
+  "direction": "loses"
+ },
+ {
+  "id": "B5",
+  "statement": "Шорт от сжатия при net20 > -1.0 выигрывает не реже 50%.",
+  "scope": "net20 > -1.0",
+  "status": "UNTESTED",
+  "history": [],
+  "direction": "wins"
+ },
+ {
+  "id": "B6",
+  "direction": "wins",
+  "statement": "НЕ ПРОВЕРЕНО: при очень низкой реализованной волатильности (vol20<=0.4) шорт от сжатия работает лучше. Знак одинаков на трёх сегментах, LOSO дал вывод в 1 ротации из 3 (+0.459R на отложенном, n=12). В политику НЕ внесено — проверять не на чем.",
+  "scope": "vol20 <= 0.4",
+  "status": "UNTESTED",
+  "history": []
  }
 ]
