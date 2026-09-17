@@ -1,0 +1,82 @@
+{
+ "H1-01": {
+  "bars": 2196,
+  "from": "2023-01-02",
+  "to": "2023-05-17",
+  "sha": "4847e56d2a88",
+  "drift_pct": 8.5,
+  "never_seen": true
+ },
+ "H1-02": {
+  "bars": 2196,
+  "from": "2023-05-17",
+  "to": "2023-09-28",
+  "sha": "60b42e335448",
+  "drift_pct": -5.2,
+  "never_seen": true
+ },
+ "H1-03": {
+  "bars": 2196,
+  "from": "2023-09-28",
+  "to": "2024-02-13",
+  "sha": "d53ba9062ff9",
+  "drift_pct": 7.6,
+  "never_seen": true
+ },
+ "H1-04": {
+  "bars": 2196,
+  "from": "2024-02-13",
+  "to": "2024-06-26",
+  "sha": "b9a2ce5c8526",
+  "drift_pct": 13.7,
+  "never_seen": true
+ },
+ "H1-05": {
+  "bars": 2196,
+  "from": "2024-06-26",
+  "to": "2024-11-07",
+  "sha": "17db3dedb329",
+  "drift_pct": 16.8,
+  "never_seen": true
+ },
+ "H1-06": {
+  "bars": 2196,
+  "from": "2024-11-07",
+  "to": "2025-03-25",
+  "sha": "7fad05e2bd2a",
+  "drift_pct": 12.2,
+  "never_seen": false
+ },
+ "H1-07": {
+  "bars": 2196,
+  "from": "2025-03-25",
+  "to": "2025-08-07",
+  "sha": "d4dd34cb1967",
+  "drift_pct": 12.4,
+  "never_seen": false
+ },
+ "H1-08": {
+  "bars": 2196,
+  "from": "2025-08-07",
+  "to": "2025-12-19",
+  "sha": "68a105921374",
+  "drift_pct": 28.1,
+  "never_seen": false
+ },
+ "H1-09": {
+  "bars": 2196,
+  "from": "2025-12-19",
+  "to": "2026-05-06",
+  "sha": "f7d17529e68e",
+  "drift_pct": 8.3,
+  "never_seen": false
+ },
+ "H1-10": {
+  "bars": 2197,
+  "from": "2026-05-06",
+  "to": "2026-09-17",
+  "sha": "741241231b33",
+  "drift_pct": -7.0,
+  "never_seen": false
+ }
+}
