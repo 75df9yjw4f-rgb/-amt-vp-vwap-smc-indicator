@@ -21,6 +21,8 @@ def digest(obj):
 class Ledger:
     def __init__(self, path):
         self.path = path
+        self._tail = None      # cached chain hash; re-reading the whole file
+                               # on every append made long runs quadratic
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
 
     def append(self, kind, payload):
@@ -30,6 +32,7 @@ class Ledger:
         rec['chain'] = digest({'p': prev, 'h': rec['hash']})
         with open(self.path, 'a') as fh:
             fh.write(json.dumps(rec, **CANON) + '\n')
+        self._tail = rec['chain']
         return rec
 
     def read(self):
@@ -38,8 +41,10 @@ class Ledger:
         return [json.loads(l) for l in open(self.path) if l.strip()]
 
     def tail_hash(self):
-        recs = self.read()
-        return recs[-1]['chain'] if recs else None
+        if self._tail is None:
+            recs = self.read()
+            self._tail = recs[-1]['chain'] if recs else None
+        return self._tail
 
     def verify(self):
         """Returns (ok, problems). Checks payload hashes and the chain."""
