@@ -18,10 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from features import load    # noqa: E402
 from regime import regime    # noqa: E402
 
-SRC = [('SEG-1', 'research/loop/TEST.csv', 'ledger.jsonl'),
-       ('SEG-2/3', 'research/blank/FORWARD.csv', 'ledger_seg2.jsonl'),
-       ('SEG-4', 'research/loop/SEG4.csv', 'ledger_seg4.jsonl'),
-       ('SEG-5', 'research/loop/SEG5.csv', 'ledger_seg5.jsonl')]
+SRC = []   # очищено: сегментов нового эксперимента ещё нет
 MIN_SIDE = 8
 
 

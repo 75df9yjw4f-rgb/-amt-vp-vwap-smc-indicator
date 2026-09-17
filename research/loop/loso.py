@@ -18,9 +18,7 @@ from features import load, features   # noqa: E402
 from engine import simulate, WARMUP   # noqa: E402
 
 EX = {"sl_pct": 0.15, "tp_pct": 0.15, "max_bars": 48, "cooldown": 20}
-SEGS = [('SEG-1', 'research/loop/TEST.csv'),
-        ('SEG-2/3', 'research/blank/FORWARD.csv'),
-        ('SEG-4', 'research/loop/SEG4.csv')]
+SEGS = []  # очищено: сегментов нового эксперимента ещё нет
 
 GRID = [('net20', '>', th) for th in (-2.0, -1.5, -1.0, -0.5, 0.0)] + \
        [('net60', '<=', th) for th in (-2.0, -1.0, 0.0, 1.0)] + \

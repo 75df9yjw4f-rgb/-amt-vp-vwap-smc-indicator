@@ -35,7 +35,5 @@ def sweep(path, pcts, filt=True, quarters=1):
         print(line)
 
 if __name__ == '__main__':
-    print("SEG-5 (15м), с фильтром R0 — чувствительность к скобке и стабильность по времени:")
-    sweep('research/loop/SEG5.csv', [0.25, 0.30, 0.376, 0.45, 0.55], quarters=4)
-    print("\nSEG-5 БЕЗ фильтра R0 (чтобы отделить вклад гипотезы от вклада урока):")
-    sweep('research/loop/SEG5.csv', [0.376], filt=False, quarters=4)
+    print("Инструмент готов, но сегментов нового эксперимента ещё нет.")
+    print("Использование: sweep(<файл баров>, [<скобки>], quarters=4)")
