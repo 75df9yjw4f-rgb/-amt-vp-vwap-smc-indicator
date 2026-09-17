@@ -53,19 +53,29 @@ def simulate(b, i, side, ex):
         # sweep: on BTC the 99th-percentile bar range sits at 3.5-3.8x the mean
         # in every window measured, so a stop beyond that is outside ordinary
         # bar noise rather than tuned to a result.
+        unit = dist / ex['k_med']          # one median range, in price
         cap = ex.get('k_stop')
-        stop = (e - sgn * cap * dist / ex['k_med']) if cap else None
+        tgt = ex.get('k_target')
+        stop = (e - sgn * cap * unit) if cap else None
+        target = (e + sgn * tgt * unit) if tgt else None
         mfe = 0.0
         for m in range(1, k + 1):
             y = b[i + m]
             fav = (y['h'] - e) if side == 'LONG' else (e - y['l'])
             mfe = max(mfe, fav / dist)
+            # stop is checked first: if both are touched on one bar the loss wins
             if stop is not None:
                 hit = (y['l'] <= stop) if side == 'LONG' else (y['h'] >= stop)
                 if hit:
                     return dict(r=round(sgn * (stop - e) / dist, 3), bars=m,
                                 outcome='CAP', mfe=round(mfe, 3), mae=0.0,
                                 exit_price=stop)
+            if target is not None:
+                hit = (y['h'] >= target) if side == 'LONG' else (y['l'] <= target)
+                if hit:
+                    return dict(r=round(sgn * (target - e) / dist, 3), bars=m,
+                                outcome='TGT', mfe=round(mfe, 3), mae=0.0,
+                                exit_price=target)
         x = b[i + k]
         return dict(r=round(sgn * (x['c'] - e) / dist, 3), bars=k,
                     outcome='HORIZON', mfe=round(mfe, 3), mae=0.0,
