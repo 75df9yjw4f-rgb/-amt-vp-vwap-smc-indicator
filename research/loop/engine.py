@@ -4,6 +4,7 @@
 decision at all — not "is not read", but is not present. The outcome is computed
 only after the decision has been hashed into the ledger.
 """
+import statistics
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -12,15 +13,32 @@ from features import load, features            # noqa: E402
 from ledger import Ledger                       # noqa: E402
 from policy import load_all, active_at          # noqa: E402
 
-WARMUP = 120
+WARMUP = 500   # медиане скобки нужны 500 баров; объявлено в docs/29
+
+
+def bracket_distance(b, i, ex):
+    """Stop distance in price, computed from bars <= i only.
+
+    `k_med` sizes the bracket in median bar ranges of a trailing window, so the
+    bracket is known at the entry bar and adapts to the regime. Experiment 1
+    used a fixed percentage derived from the whole segment's medians — a
+    parameter that saw the future even though no decision did.
+    """
+    if 'k_med' in ex:
+        w = ex.get('med_window', 500)
+        seg = b[max(0, i - w + 1):i + 1]
+        med = statistics.median(x['h'] - x['l'] for x in seg)
+        return ex['k_med'] * med
+    return b[i]['c'] * ex['sl_pct'] / 100.0
 
 
 def simulate(b, i, side, ex):
     """Pessimistic: if stop and target are both touched on a bar, the stop wins."""
     e = b[i]['c']
     sgn = 1 if side == 'LONG' else -1
-    stop = e - sgn * e * ex['sl_pct'] / 100.0
-    target = e + sgn * e * ex['tp_pct'] / 100.0
+    dist = bracket_distance(b, i, ex)
+    stop = e - sgn * dist
+    target = e + sgn * dist
     risk = abs(e - stop)
     mfe = mae = 0.0
     for k in range(1, ex['max_bars'] + 1):
