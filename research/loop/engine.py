@@ -33,10 +33,27 @@ def bracket_distance(b, i, ex):
 
 
 def simulate(b, i, side, ex):
-    """Pessimistic: if stop and target are both touched on a bar, the stop wins."""
+    """Pessimistic: if stop and target are both touched on a bar, the stop wins.
+
+    With `exit_after` the trade instead closes at a fixed horizon with no stop
+    and no target. That exists because of lesson L1-BTC: a bracket race asks
+    "which of +-K ranges comes first", while a directional mechanism claims
+    something about where price is after N bars. Those are different questions,
+    and a rule should measure what its mechanism claims.
+    """
     e = b[i]['c']
     sgn = 1 if side == 'LONG' else -1
     dist = bracket_distance(b, i, ex)
+    if ex.get('exit_after'):
+        k = ex['exit_after']
+        if i + k >= len(b):
+            return None
+        x = b[i + k]
+        rm = sgn * (x['c'] - e) / dist
+        mfe = max((sgn * (y['h'] - e) if side == 'LONG' else sgn * (e - y['l'])) / dist
+                  for y in b[i + 1:i + k + 1])
+        return dict(r=round(rm, 3), bars=k, outcome='HORIZON', mfe=round(mfe, 3),
+                    mae=0.0, exit_price=x['c'])
     stop = e - sgn * dist
     target = e + sgn * dist
     risk = abs(e - stop)
