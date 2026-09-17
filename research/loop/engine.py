@@ -48,12 +48,28 @@ def simulate(b, i, side, ex):
         k = ex['exit_after']
         if i + k >= len(b):
             return None
+        # `k_stop` caps the loss tail without imposing a target. The multiplier is
+        # meant to come from the instrument's own tail geometry, not from a P&L
+        # sweep: on BTC the 99th-percentile bar range sits at 3.5-3.8x the mean
+        # in every window measured, so a stop beyond that is outside ordinary
+        # bar noise rather than tuned to a result.
+        cap = ex.get('k_stop')
+        stop = (e - sgn * cap * dist / ex['k_med']) if cap else None
+        mfe = 0.0
+        for m in range(1, k + 1):
+            y = b[i + m]
+            fav = (y['h'] - e) if side == 'LONG' else (e - y['l'])
+            mfe = max(mfe, fav / dist)
+            if stop is not None:
+                hit = (y['l'] <= stop) if side == 'LONG' else (y['h'] >= stop)
+                if hit:
+                    return dict(r=round(sgn * (stop - e) / dist, 3), bars=m,
+                                outcome='CAP', mfe=round(mfe, 3), mae=0.0,
+                                exit_price=stop)
         x = b[i + k]
-        rm = sgn * (x['c'] - e) / dist
-        mfe = max((sgn * (y['h'] - e) if side == 'LONG' else sgn * (e - y['l'])) / dist
-                  for y in b[i + 1:i + k + 1])
-        return dict(r=round(rm, 3), bars=k, outcome='HORIZON', mfe=round(mfe, 3),
-                    mae=0.0, exit_price=x['c'])
+        return dict(r=round(sgn * (x['c'] - e) / dist, 3), bars=k,
+                    outcome='HORIZON', mfe=round(mfe, 3), mae=0.0,
+                    exit_price=x['c'])
     stop = e - sgn * dist
     target = e + sgn * dist
     risk = abs(e - stop)
