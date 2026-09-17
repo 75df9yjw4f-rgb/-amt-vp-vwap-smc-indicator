@@ -1,0 +1,23 @@
+{
+ "LEARN": {
+  "bars": 6587,
+  "from": "2026-02-01",
+  "to": "2026-04-10",
+  "sha256_16": "6f2a68bbaa1d189e",
+  "file": "research/loop/data/BTC-LEARN.csv"
+ },
+ "SEG-A": {
+  "bars": 7685,
+  "from": "2026-04-10",
+  "to": "2026-06-29",
+  "sha256_16": "75f0fef7b78f4cdf",
+  "file": "research/loop/data/BTC-SEG-A.csv"
+ },
+ "SEG-B": {
+  "bars": 7686,
+  "from": "2026-06-29",
+  "to": "2026-09-17",
+  "sha256_16": "ef896d34b7bcd7b4",
+  "file": "research/loop/data/BTC-SEG-B.csv"
+ }
+}
